@@ -1,0 +1,12 @@
+{
+  "extension.displayName": "Tableaux de bord F4Data",
+  "extension.description": "Importez, créez et explorez des tableaux de bord de données locaux.",
+  "viewContainer.title": "Tableaux de bord F4Data",
+  "view.dashboards": "Tableaux de bord F4Data",
+  "welcome.dashboards": "Aucun tableau de bord pour le moment.\n\n[Créer un tableau de bord](command:f4datadashb.createDashboard)\n\n[Ajouter un tableau de bord existant](command:f4datadashb.importDashboard)",
+  "command.importDashboard": "Importer un tableau de bord",
+  "command.createDashboard": "Créer un tableau de bord",
+  "command.generateDashboardInFolder": "Générer un tableau de bord F4Data dans ce dossier",
+  "command.removeDashboard": "Retirer le tableau de bord",
+  "command.openDashboard": "Ouvrir le tableau de bord"
+}

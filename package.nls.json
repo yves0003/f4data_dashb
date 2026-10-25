@@ -1,0 +1,12 @@
+{
+  "extension.displayName": "F4Data Dashboards",
+  "extension.description": "Import, create and explore local data dashboards.",
+  "viewContainer.title": "F4Data Dashboards",
+  "view.dashboards": "F4Data Dashboards",
+  "welcome.dashboards": "No dashboards yet.\n\n[Create a dashboard](command:f4datadashb.createDashboard)\n\n[Add an existing dashboard](command:f4datadashb.importDashboard)",
+  "command.importDashboard": "Import Dashboard",
+  "command.createDashboard": "Create Dashboard",
+  "command.generateDashboardInFolder": "Initialize F4Data Dashboard in This Folder",
+  "command.removeDashboard": "Remove Dashboard",
+  "command.openDashboard": "Open Dashboard"
+}

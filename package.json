@@ -1,0 +1,123 @@
+{
+  "name": "f4datadashb",
+  "displayName": "%extension.displayName%",
+  "description": "%extension.description%",
+  "version": "0.0.1",
+  "publisher": "local",
+  "license": "MIT",
+  "icon": "media/icon.png",
+  "engines": {
+    "vscode": "^1.90.0"
+  },
+  "categories": [
+    "Visualization"
+  ],
+  "activationEvents": [
+    "onView:f4datadashb.dashboards",
+    "onCommand:f4datadashb.importDashboard",
+    "onCommand:f4datadashb.createDashboard",
+    "onCommand:f4datadashb.generateDashboardInFolder",
+    "onCommand:f4datadashb.removeDashboard",
+    "onCommand:f4datadashb.openDashboard"
+  ],
+  "main": "./out/extension.js",
+  "contributes": {
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "f4datadashb",
+          "title": "%viewContainer.title%",
+          "icon": "media/icon.svg"
+        }
+      ]
+    },
+    "views": {
+      "f4datadashb": [
+        {
+          "id": "f4datadashb.dashboards",
+          "name": "%view.dashboards%"
+        }
+      ]
+    },
+    "viewsWelcome": [
+      {
+        "view": "f4datadashb.dashboards",
+        "contents": "%welcome.dashboards%"
+      }
+    ],
+    "commands": [
+      {
+        "command": "f4datadashb.importDashboard",
+        "title": "%command.importDashboard%",
+        "icon": "$(folder-opened)"
+      },
+      {
+        "command": "f4datadashb.createDashboard",
+        "title": "%command.createDashboard%",
+        "icon": "$(add)"
+      },
+      {
+        "command": "f4datadashb.generateDashboardInFolder",
+        "title": "%command.generateDashboardInFolder%"
+      },
+      {
+        "command": "f4datadashb.removeDashboard",
+        "title": "%command.removeDashboard%"
+      },
+      {
+        "command": "f4datadashb.openDashboard",
+        "title": "%command.openDashboard%",
+        "icon": "$(eye)"
+      }
+    ],
+    "menus": {
+      "explorer/context": [
+        {
+          "command": "f4datadashb.generateDashboardInFolder",
+          "when": "resourceScheme == file && explorerResourceIsFolder",
+          "group": "1_create"
+        }
+      ],
+      "view/title": [
+        {
+          "command": "f4datadashb.importDashboard",
+          "when": "view == f4datadashb.dashboards",
+          "group": "navigation"
+        },
+        {
+          "command": "f4datadashb.createDashboard",
+          "when": "view == f4datadashb.dashboards",
+          "group": "navigation"
+        }
+      ],
+      "view/item/context": [
+        {
+          "command": "f4datadashb.openDashboard",
+          "when": "view == f4datadashb.dashboards && viewItem == f4datadashb.dashboardItem",
+          "group": "inline"
+        },
+        {
+          "command": "f4datadashb.removeDashboard",
+          "when": "view == f4datadashb.dashboards && viewItem == f4datadashb.dashboardItem",
+          "group": "navigation"
+        }
+      ]
+    }
+  },
+  "scripts": {
+    "vscode:prepublish": "npm run compile",
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./",
+    "check": "tsc --noEmit -p ./",
+    "package:extension": "node -e \"require('node:fs').mkdirSync('package', { recursive: true })\" && vsce package --out package/f4datadashb-0.0.1.vsix"
+  },
+  "dependencies": {
+    "@duckdb/node-api": "^2.0.0-r.1"
+  },
+  "devDependencies": {
+    "@types/node": "^20.12.12",
+    "@types/vscode": "^1.90.0",
+    "@vscode/vsce": "^4.0.0",
+    "typescript": "^5.4.5"
+  }
+}
