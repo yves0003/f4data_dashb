@@ -29,9 +29,9 @@ If the host window opens but the view is missing, run **Developer: Reload Window
 
 ## Build a local VSIX
 
-Run `npm install`, then `npm run package:extension`. The installable extension package is generated at `package/f4datadashb-0.0.11.vsix`. The `package/` output folder is ignored by Git. Install it in VS Code with **Extensions: Install from VSIX...**.
+Run `npm install`, then `npm run package:extension`. The installable extension package is generated at `package/f4datadashb-0.0.12.vsix`. The `package/` output folder is ignored by Git. Install it in VS Code with **Extensions: Install from VSIX...**.
 
-Pushing a version tag such as `v0.0.11` publishes the platform-specific VSIX packages to the Visual Studio Marketplace after CI succeeds. Set `publisher` in `package.json` to your Marketplace publisher ID and add a `VSCE_PAT` repository Actions secret with Marketplace publish permission.
+Pushing a version tag such as `v0.0.12` publishes the platform-specific VSIX packages to the Visual Studio Marketplace after CI succeeds. Set `publisher` in `package.json` to your Marketplace publisher ID and add a `VSCE_PAT` repository Actions secret with Marketplace publish permission.
 
 ## Generated dashboard projects
 

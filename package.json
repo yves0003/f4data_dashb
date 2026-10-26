@@ -2,7 +2,7 @@
   "name": "f4datadashb",
   "displayName": "%extension.displayName%",
   "description": "%extension.description%",
-  "version": "0.0.11",
+  "version": "0.0.12",
   "publisher": "yves0003",
   "license": "MIT",
   "icon": "media/icon.png",
@@ -113,7 +113,7 @@
     "compile": "tsc -p ./",
     "watch": "tsc -watch -p ./",
     "check": "tsc --noEmit -p ./",
-    "package:extension": "node -e \"require('node:fs').mkdirSync('package', { recursive: true })\" && vsce package --out package/f4datadashb-0.0.11.vsix"
+    "package:extension": "node -e \"require('node:fs').mkdirSync('package', { recursive: true })\" && vsce package --out package/f4datadashb-0.0.12.vsix"
   },
   "dependencies": {
     "@duckdb/node-api": "^2.0.0-r.1"
