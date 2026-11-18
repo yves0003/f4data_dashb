@@ -43,6 +43,12 @@ export function activate(context: vscode.ExtensionContext): void {
           return;
         }
         const added = await tree.add(candidates);
+        if (added === 0) {
+          if (candidates.length === 1) {
+            void vscode.window.showWarningMessage(t("dashboardAlreadyImported"));
+          }
+          return;
+        }
         void vscode.window.showInformationMessage(t("dashboardImported", String(added)));
       } catch (error) {
         void vscode.window.showErrorMessage(t("importFailed", errorMessage(error)));
@@ -50,6 +56,10 @@ export function activate(context: vscode.ExtensionContext): void {
     }),
     vscode.commands.registerCommand("f4datadashb.createDashboard", async () => {
       try {
+        const framework = await promptDashboardFramework();
+        if (!framework) {
+          return;
+        }
         const displayName = await promptDashboardTitle(t);
         if (!displayName) {
           return;
@@ -64,7 +74,7 @@ export function activate(context: vscode.ExtensionContext): void {
         if (!locations?.length) {
           return;
         }
-        await initializeDashboard(locations[0].fsPath, displayName, language, tree, t);
+        await initializeDashboard(locations[0].fsPath, displayName, language, framework, tree, t);
       } catch (error) {
         void vscode.window.showErrorMessage(t("createFailed", errorMessage(error)));
       }
@@ -75,11 +85,15 @@ export function activate(context: vscode.ExtensionContext): void {
           void vscode.window.showErrorMessage(t("selectFolderError"));
           return;
         }
+        const framework = await promptDashboardFramework();
+        if (!framework) {
+          return;
+        }
         const displayName = await promptDashboardTitle(t);
         if (!displayName) {
           return;
         }
-        await initializeDashboard(resource.fsPath, displayName, language, tree, t);
+        await initializeDashboard(resource.fsPath, displayName, language, framework, tree, t);
       } catch (error) {
         void vscode.window.showErrorMessage(t("createFailed", errorMessage(error)));
       }
@@ -128,6 +142,26 @@ export function activate(context: vscode.ExtensionContext): void {
 export function deactivate(): void {}
 
 type Translator = (key: Parameters<typeof translate>[1], ...values: string[]) => string;
+type DashboardFramework = "react" | "vanilla";
+
+async function promptDashboardFramework(): Promise<DashboardFramework | undefined> {
+  const choice = await vscode.window.showQuickPick([
+    {
+      label: "$(symbol-class) React",
+      description: translate(vscode.env.language, "reactFrameworkDescription"),
+      framework: "react" as const
+    },
+    {
+      label: `$(code) ${translate(vscode.env.language, "vanillaFrameworkLabel")}`,
+      description: translate(vscode.env.language, "vanillaFrameworkDescription"),
+      framework: "vanilla" as const
+    }
+  ], {
+    placeHolder: translate(vscode.env.language, "chooseFramework"),
+    ignoreFocusOut: true
+  });
+  return choice?.framework;
+}
 
 async function promptDashboardTitle(t: Translator): Promise<string | undefined> {
   const title = await vscode.window.showInputBox({
@@ -143,6 +177,7 @@ async function initializeDashboard(
   selectedPath: string,
   displayName: string,
   language: string,
+  framework: DashboardFramework,
   tree: DashboardTreeProvider,
   t: Translator
 ): Promise<void> {
@@ -152,9 +187,10 @@ async function initializeDashboard(
   const manifest = mergeDashboardManifest(
     fs.existsSync(manifestPath) ? readPackageManifest(manifestPath) : {},
     technicalName,
-    displayName
+    displayName,
+    framework
   );
-  const generatedFiles = getDashboardFiles(displayName, language);
+  const generatedFiles = getDashboardFiles(displayName, language, framework);
   const filesToWrite = new Map(generatedFiles);
   for (const relativePath of generatedFiles.keys()) {
     const existingPath = path.join(dashboardPath, relativePath);
@@ -179,7 +215,10 @@ async function initializeDashboard(
     }
   }
 
-  for (const directory of ["data", "vue", "src"]) {
+  const directories = framework === "react"
+    ? ["data", "vue", "src"]
+    : ["data", "vue"];
+  for (const directory of directories) {
     fs.mkdirSync(path.join(dashboardPath, directory), { recursive: true });
   }
   for (const [relativePath, contents] of filesToWrite) {
@@ -202,14 +241,27 @@ function toTechnicalName(title: string): string {
     .replace(/^-+|-+$/g, "");
 }
 
-function getDashboardFiles(title: string, language: string): Map<string, string> {
+function getDashboardFiles(
+  title: string,
+  language: string,
+  framework: DashboardFramework
+): Map<string, string> {
+  if (framework === "vanilla") {
+    return new Map([
+      [path.join("vue", "index.html"), htmlTemplate(title, language, framework)],
+      [path.join("vue", "app.js"), vanillaAppTemplate(title)],
+      [path.join("vue", "style.css"), appStyles],
+      ["SKILL_GUIDE.md", skillGuide(title, framework)]
+    ]);
+  }
+
   return new Map([
-    ["vite.config.js", viteConfig],
+    ["vite.config.js", viteReactConfig],
     [path.join("vue", "index.html"), dashboardPlaceholder(title, language)],
-    [path.join("src", "index.html"), htmlTemplate(title)],
-    [path.join("src", "App.jsx"), appTemplate(title)],
+    [path.join("src", "index.html"), htmlTemplate(title, language, framework)],
+    [path.join("src", "App.jsx"), reactAppTemplate(title)],
     [path.join("src", "style.css"), appStyles],
-    ["SKILL_GUIDE.md", skillGuide(title)]
+    ["SKILL_GUIDE.md", skillGuide(title, framework)]
   ]);
 }
 
@@ -224,21 +276,20 @@ function readPackageManifest(manifestPath: string): Record<string, unknown> {
 function mergeDashboardManifest(
   existing: Record<string, unknown>,
   technicalName: string,
-  title: string
+  title: string,
+  framework: DashboardFramework
 ): Record<string, unknown> {
-  const defaultScripts = {
+  const defaultScripts = framework === "react" ? {
     dev: "vite --host 127.0.0.1",
     build: "vite build",
     watch: "vite build --watch"
-  };
-  const defaultDependencies = {
-    react: "^18.3.1",
-    "react-dom": "^18.3.1"
-  };
-  const defaultDevDependencies = {
-    "@vitejs/plugin-react": "^4.3.1",
-    vite: "^5.4.0"
-  };
+  } : {};
+  const defaultDependencies: Record<string, string> = framework === "react"
+    ? { react: "^18.3.1", "react-dom": "^18.3.1" }
+    : {};
+  const defaultDevDependencies: Record<string, string> = framework === "react"
+    ? { "@vitejs/plugin-react": "^4.3.1", vite: "^5.4.0" }
+    : {};
   const existingScripts = asStringRecord(existing.scripts);
   const existingDependencies = asStringRecord(existing.dependencies);
   const existingDevDependencies = asStringRecord(existing.devDependencies);
@@ -285,7 +336,7 @@ function dashboardPlaceholder(title: string, language: string): string {
 </html>`;
 }
 
-const viteConfig = `
+const viteReactConfig = `
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { defineConfig } from "vite";
@@ -335,22 +386,25 @@ section { overflow: auto; margin-top: 1.5rem; }
 pre { padding: 1rem; overflow: auto; background: var(--vscode-textCodeBlock-background, #8882); }
 `;
 
-function htmlTemplate(title: string): string {
+function htmlTemplate(title: string, language: string, framework: DashboardFramework): string {
+  const lang = language.toLowerCase().startsWith("fr") ? "fr" : "en";
+  const isReact = framework === "react";
   return `<!doctype html>
-<html lang="fr">
+<html lang="${lang}">
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>${escapeHtml(title)}</title>
+    <link rel="stylesheet" href="./style.css" />
   </head>
   <body>
-    <div id="root"></div>
-    <script type="module" src="./App.jsx"></script>
+    ${isReact ? '<div id="root"></div>' : '<main id="app"></main>'}
+    <script ${isReact ? 'type="module"' : "defer"} src="./${isReact ? "App.jsx" : "app.js"}"></script>
   </body>
 </html>`;
 }
 
-function appTemplate(title: string): string {
+function reactAppTemplate(title: string): string {
   const titleValue = JSON.stringify(title);
   return `import { useEffect, useState } from "react";
 import { createRoot } from "react-dom/client";
@@ -448,17 +502,203 @@ createRoot(document.getElementById("root")).render(<App />);
 `;
 }
 
-function skillGuide(title: string): string {
+function vanillaAppTemplate(title: string): string {
+  const titleValue = JSON.stringify(title);
+  return `const vscode = typeof acquireVsCodeApi === "function" ? acquireVsCodeApi() : undefined;
+const dashboardTitle = ${titleValue};
+const browserData = {
+  files: ["Browser preview"],
+  datasets: [{
+    name: "Sample data",
+    columns: ["category", "value"],
+    rows: [{ category: "Example", value: 42 }]
+  }]
+};
+const french = navigator.language.toLowerCase().startsWith("fr");
+const app = document.getElementById("app");
+let state = { status: "loading", data: null, error: "" };
+let result = null;
+let sql = "SHOW TABLES";
+
+function render() {
+  app.replaceChildren();
+  const main = document.createElement("main");
+  app.append(main);
+
+  if (state.status === "loading") {
+    const loading = document.createElement("p");
+    loading.setAttribute("role", "status");
+    loading.textContent = french ? "Chargement des données…" : "Loading data…";
+    main.append(loading);
+    return;
+  }
+
+  const heading = document.createElement("h1");
+  heading.textContent = dashboardTitle;
+  main.append(heading);
+
+  if (state.status === "error") {
+    const error = document.createElement("p");
+    error.setAttribute("role", "alert");
+    error.textContent = state.error;
+    main.append(error, createButton(french ? "Réessayer" : "Retry", refresh));
+    return;
+  }
+
+  if (state.status === "empty") {
+    const empty = document.createElement("p");
+    empty.textContent = french
+      ? "Aucun fichier CSV, TSV, Parquet ou DuckDB dans data/."
+      : "No CSV, TSV, Parquet, or DuckDB file in data/.";
+    main.append(empty);
+    return;
+  }
+
+  const header = document.createElement("header");
+  const refreshButton = createButton(french ? "Actualiser" : "Refresh", refresh);
+  header.append(refreshButton);
+  main.append(header);
+
+  const files = document.createElement("p");
+  files.textContent = state.data.files.join(", ");
+  main.append(files);
+
+  const label = document.createElement("label");
+  label.htmlFor = "sql";
+  label.textContent = french ? "Requête DuckDB" : "DuckDB query";
+  const editor = document.createElement("textarea");
+  editor.id = "sql";
+  editor.value = sql;
+  editor.addEventListener("input", () => { sql = editor.value; });
+  main.append(label, editor, createButton(french ? "Exécuter" : "Run", runQuery));
+
+  if (state.error) {
+    const error = document.createElement("p");
+    error.setAttribute("role", "alert");
+    error.textContent = state.error;
+    main.append(error);
+  }
+
+  for (const [index, dataset] of (result ? [result] : state.data.datasets).entries()) {
+    const section = document.createElement("section");
+    const title = document.createElement("h2");
+    title.textContent = dataset.name ?? (french ? "Résultat de la requête" : "Query result");
+    section.append(title);
+    if (dataset.error) {
+      const error = document.createElement("p");
+      error.setAttribute("role", "alert");
+      error.textContent = dataset.error;
+      section.append(error);
+    } else {
+      const rows = document.createElement("pre");
+      rows.textContent = JSON.stringify(dataset.rows, null, 2);
+      section.append(rows);
+    }
+    section.dataset.index = String(index);
+    main.append(section);
+  }
+}
+
+function createButton(label, action) {
+  const button = document.createElement("button");
+  button.type = "button";
+  button.textContent = label;
+  button.addEventListener("click", action);
+  return button;
+}
+
+function refresh() {
+  if (vscode) {
+    state = { ...state, status: "loading", error: "" };
+    render();
+    vscode.postMessage({ command: "refresh" });
+  } else {
+    result = null;
+    state = { status: "ready", data: browserData, error: "" };
+    render();
+  }
+}
+
+function runQuery() {
+  state = { ...state, error: "" };
+  if (vscode) {
+    vscode.postMessage({ command: "runQuery", requestId: String(Date.now()), sql, force: true });
+  } else {
+    result = {
+      name: "Browser preview (sample data)",
+      columns: browserData.datasets[0].columns,
+      rows: browserData.datasets[0].rows
+    };
+    render();
+  }
+}
+
+window.addEventListener("message", (event) => {
+  const message = event.data;
+  if (message.command === "initData") {
+    const datasets = message.data?.datasets ?? [];
+    state = { status: datasets.length > 0 ? "ready" : "empty", data: message.data, error: "" };
+    result = null;
+    render();
+  } else if (message.command === "dashboardError") {
+    state = { status: "error", data: null, error: message.error };
+    render();
+  } else if (message.command === "queryResult") {
+    result = {
+      name: french ? "Résultat de la requête" : "Query result",
+      columns: message.columns,
+      rows: message.rows
+    };
+    render();
+  } else if (message.command === "queryError") {
+    state = { ...state, error: message.error };
+    render();
+  }
+});
+
+render();
+if (vscode) {
+  vscode.postMessage({ command: "ready" });
+} else {
+  state = { status: "ready", data: browserData, error: "" };
+  render();
+}
+`;
+}
+
+function skillGuide(title: string, framework: DashboardFramework): string {
+  const frameworkName = framework === "react" ? "React" : "HTML, CSS et JavaScript natifs";
+  const sourceGuide = framework === "react"
+    ? "Les sources React se trouvent dans `src/App.jsx` et `src/style.css`."
+    : "Les fichiers prêts à l’emploi se trouvent dans `vue/index.html`, `vue/app.js` et `vue/style.css`. L’interface utilise les API DOM natives, sans framework JavaScript ni outil de build.";
+  const workflowGuide = framework === "react"
+    ? `- \`npm install\` installe React, Vite et le plugin React.
+- \`npm run dev\` démarre le dashboard dans un navigateur.
+- \`npm run build\` produit \`vue/index.html\`, utilisé par l’extension.
+- \`npm run watch\` reconstruit le dashboard à chaque changement ; la Webview active se recharge automatiquement.`
+    : `Aucune installation ni compilation n’est nécessaire : l’extension charge directement \`vue/index.html\`. Ouvrez ce fichier dans un navigateur pour la prévisualisation ; \`acquireVsCodeApi()\` est détecté uniquement dans la Webview VS Code.`;
   return `# ${title} — guide de développement
 
-Ce dashboard est une application React construite avec Vite. Les sources sont dans \`src/\` et le build est écrit dans \`vue/\`, que l’extension VS Code charge dans une Webview.
+Ce dashboard utilise ${frameworkName}. ${sourceGuide}${framework === "react" ? " Le build est écrit dans `vue/`, que l’extension VS Code charge dans une Webview." : " L’extension VS Code charge ces fichiers statiques depuis `vue/` dans une Webview."}
+
+## Sources de données
+
+Par défaut, les fichiers CSV, TSV, Parquet et DuckDB directement placés dans \`data/\` sont utilisés. Pour choisir des sources externes, ajoutez une propriété \`dataSources\` au \`package.json\` :
+
+\`\`\`json
+{
+  "dataSources": [
+    { "name": "warehouse", "type": "duckdb", "path": "../shared/warehouse.duckdb" },
+    { "name": "sales", "type": "csv", "path": "../exports/sales.csv" }
+  ]
+}
+\`\`\`
+
+Les chemins relatifs sont résolus depuis la racine du dashboard. Dès que la propriété \`dataSources\` existe, elle est prioritaire et le dossier \`data/\` n’est pas parcouru. Supprimez cette propriété pour revenir au mode automatique.
 
 ## Démarrage
 
-- \`npm install\` installe React, Vite et le plugin React.
-- \`npm run dev\` démarre le dashboard dans un navigateur pour le développement.
-- \`npm run build\` produit \`vue/index.html\`, utilisé par l’extension.
-- \`npm run watch\` reconstruit le dashboard à chaque changement ; la Webview active se recharge automatiquement.
+${workflowGuide}
 
 ## Communication navigateur / VS Code
 

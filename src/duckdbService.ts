@@ -6,6 +6,18 @@ export interface DataFile {
   name: string;
   path: string;
   type: "csv" | "tsv" | "parquet" | "duckdb";
+  alias?: string;
+}
+
+export interface DataWatchPattern {
+  basePath: string;
+  pattern: string;
+}
+
+interface DataSourceConfig {
+  name: string;
+  path: string;
+  type: DataFile["type"];
 }
 
 export interface DatasetResult {
@@ -31,8 +43,7 @@ export class DuckDbService {
   private readonly initialCache = new Map<string, { fingerprint: string; data: InitialData }>();
 
   async loadInitialData(dashboardPath: string, force = false): Promise<InitialData> {
-    const dataPath = path.join(dashboardPath, "data");
-    const files = listDataFiles(dataPath);
+    const files = resolveDataFiles(dashboardPath);
     const fingerprint = getFingerprint(files);
     const cached = !force ? this.initialCache.get(path.resolve(dashboardPath)) : undefined;
     if (cached?.fingerprint === fingerprint) {
@@ -54,7 +65,7 @@ export class DuckDbService {
                 const query = `SELECT * FROM ${quoteIdentifier(alias)}.${quoteIdentifier(schema)}.${quoteIdentifier(tableName)} LIMIT 100`;
                 const result = await readQuery(connection, query);
                 results.push({
-                  name: `${file.name}: ${tableName}`,
+                  name: `${file.alias ? `${file.alias}: ` : `${file.name}: `}${tableName}`,
                   columns: result.columns,
                   rows: result.rows
                 });
@@ -65,7 +76,7 @@ export class DuckDbService {
               `SELECT * FROM ${quoteIdentifier(viewName(file, files))} LIMIT 100`
             );
             results.push({
-              name: file.name,
+              name: file.alias ?? file.name,
               columns: result.columns,
               rows: result.rows
             });
@@ -82,13 +93,16 @@ export class DuckDbService {
       return results;
     });
 
-    const data: InitialData = { files: files.map((file) => file.name), datasets };
+    const data: InitialData = {
+      files: files.map((file) => file.alias ? `${file.alias} (${file.name})` : file.name),
+      datasets
+    };
     this.initialCache.set(path.resolve(dashboardPath), { fingerprint, data });
     return data;
   }
 
   async query(dashboardPath: string, sql: string, force = false): Promise<QueryCacheEntry> {
-    const files = listDataFiles(path.join(dashboardPath, "data"));
+    const files = resolveDataFiles(dashboardPath);
     const fingerprint = getFingerprint(files);
     const cache = this.dashboardCache(dashboardPath);
     const key = sql.trim();
@@ -115,6 +129,15 @@ export class DuckDbService {
     const key = path.resolve(dashboardPath);
     this.cache.delete(key);
     this.initialCache.delete(key);
+  }
+
+  getDataWatchPatterns(dashboardPath: string): DataWatchPattern[] {
+    const files = resolveDataFiles(dashboardPath);
+    const directories = new Set(files.map((file) => path.dirname(file.path)));
+    if (files.length === 0 && !hasConfiguredDataSources(dashboardPath)) {
+      directories.add(path.resolve(dashboardPath, "data"));
+    }
+    return [...directories].map((basePath) => ({ basePath, pattern: "**/*" }));
   }
 
   private dashboardCache(dashboardPath: string): Map<string, QueryCacheEntry> {
@@ -148,7 +171,7 @@ export class DuckDbService {
         const readerFunction = file.type === "parquet" ? "read_parquet" : "read_csv_auto";
         const options = file.type === "tsv" ? ", delim='\\t'" : "";
         const result = await connection.run(
-          `CREATE OR REPLACE VIEW ${quoteIdentifier(viewName(file, files))} AS SELECT * FROM ${readerFunction}(${quoteString(file.path)}${options})`
+          `CREATE OR REPLACE VIEW ${quoteIdentifier(viewName(file, files))} AS SELECT * FROM ${readerFunction}(${quoteString(escapeGlob(file.path))}${options})`
         );
         result.closeSync();
       }
@@ -186,19 +209,142 @@ function listDataFiles(dataPath: string): DataFile[] {
     .sort((left, right) => left.name.localeCompare(right.name));
 }
 
+function resolveDataFiles(dashboardPath: string): DataFile[] {
+  const resolvedDashboardPath = path.resolve(dashboardPath);
+  const manifestPath = path.join(resolvedDashboardPath, "package.json");
+  const parsedManifest: unknown = JSON.parse(fs.readFileSync(manifestPath, "utf8"));
+  if (typeof parsedManifest !== "object" || parsedManifest === null || Array.isArray(parsedManifest)) {
+    throw new Error("Dashboard package.json must contain a JSON object");
+  }
+  const manifest = parsedManifest as Record<string, unknown>;
+
+  if (!Object.prototype.hasOwnProperty.call(manifest, "dataSources")) {
+    return listDataFiles(path.join(resolvedDashboardPath, "data"));
+  }
+
+  if (!Array.isArray(manifest.dataSources)) {
+    throw new Error("package.json dataSources must be an array");
+  }
+
+  const sources = manifest.dataSources.map(parseDataSource);
+  const sourceNames = new Set<string>();
+  const files: DataFile[] = [];
+
+  for (const source of sources) {
+    if (sourceNames.has(source.name)) {
+      throw new Error(`Duplicate data source name "${source.name}"`);
+    }
+    sourceNames.add(source.name);
+
+    const sourcePath = normalizeSourcePath(resolvedDashboardPath, source.path);
+    const stat = fs.statSync(sourcePath);
+    const matchingFiles = stat.isDirectory()
+      ? fs.readdirSync(sourcePath, { withFileTypes: true })
+        .filter((entry) => entry.isFile() && matchesType(entry.name, source.type))
+        .map((entry) => path.resolve(sourcePath, entry.name))
+        .sort((left, right) => left.localeCompare(right))
+      : stat.isFile() && matchesType(sourcePath, source.type)
+        ? [sourcePath]
+        : [];
+
+    if (matchingFiles.length === 0) {
+      throw new Error(`Data source "${source.name}" has no ${source.type} files at "${sourcePath}"`);
+    }
+
+    for (const filePath of matchingFiles) {
+      const fileName = path.basename(filePath);
+      const sourceAlias = stat.isDirectory()
+        ? `${source.name}_${path.basename(fileName, path.extname(fileName))}`
+        : source.name;
+      files.push({
+        name: fileName,
+        path: filePath,
+        type: source.type,
+        alias: sourceAlias
+      });
+    }
+  }
+
+  const aliases = new Set<string>();
+  for (const file of files) {
+    const alias = file.alias ?? file.name;
+    if (aliases.has(alias)) {
+      throw new Error(`Duplicate data source alias "${alias}"`);
+    }
+    aliases.add(alias);
+  }
+  return files;
+}
+
+function hasConfiguredDataSources(dashboardPath: string): boolean {
+  const manifestPath = path.join(path.resolve(dashboardPath), "package.json");
+  const parsedManifest: unknown = JSON.parse(fs.readFileSync(manifestPath, "utf8"));
+  if (typeof parsedManifest !== "object" || parsedManifest === null || Array.isArray(parsedManifest)) {
+    throw new Error("Dashboard package.json must contain a JSON object");
+  }
+  return Object.prototype.hasOwnProperty.call(parsedManifest, "dataSources");
+}
+
+function parseDataSource(value: unknown): DataSourceConfig {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    throw new Error("Each package.json dataSources entry must be an object");
+  }
+  const source = value as Record<string, unknown>;
+  if (typeof source.name !== "string" || !source.name.trim()) {
+    throw new Error("Each package.json dataSources entry needs a non-empty name");
+  }
+  if (typeof source.path !== "string" || !source.path.trim()) {
+    throw new Error(`Data source "${source.name}" needs a non-empty path`);
+  }
+  if (source.type !== "csv" && source.type !== "tsv" && source.type !== "parquet" && source.type !== "duckdb") {
+    throw new Error(`Data source "${source.name}" has an unsupported type`);
+  }
+  return {
+    name: source.name.trim(),
+    path: source.path.trim(),
+    type: source.type
+  };
+}
+
+function normalizeSourcePath(dashboardPath: string, sourcePath: string): string {
+  return path.normalize(path.isAbsolute(sourcePath)
+    ? path.resolve(sourcePath)
+    : path.resolve(dashboardPath, sourcePath));
+}
+
+function matchesType(filePath: string, type: DataFile["type"]): boolean {
+  const extension = path.extname(filePath).toLowerCase();
+  switch (type) {
+    case "csv":
+      return extension === ".csv";
+    case "tsv":
+      return extension === ".tsv";
+    case "parquet":
+      return extension === ".parquet";
+    case "duckdb":
+      return extension === ".duckdb" || extension === ".ddb";
+  }
+}
+
 function getFingerprint(files: DataFile[]): string {
   return files.map((file) => {
     const stat = fs.statSync(file.path);
-    return `${file.path}:${stat.size}:${stat.mtimeMs}`;
+    return `${file.alias ?? ""}:${file.type}:${file.path}:${stat.size}:${stat.mtimeMs}`;
   }).join("|");
 }
 
 function viewName(file: DataFile, files: DataFile[]): string {
+  if (file.alias) {
+    return file.alias;
+  }
   const stem = path.basename(file.name, path.extname(file.name));
   return `data_${files.indexOf(file)}_${stem.replace(/[^a-zA-Z0-9_]/g, "_")}_${file.type}`;
 }
 
 function databaseAlias(file: DataFile, files: DataFile[]): string {
+  if (file.alias) {
+    return file.alias;
+  }
   return `db_${files.indexOf(file)}_${path.basename(file.name, path.extname(file.name)).replace(/[^a-zA-Z0-9_]/g, "_")}`;
 }
 
@@ -207,7 +353,14 @@ function quoteIdentifier(identifier: string): string {
 }
 
 function quoteString(value: string): string {
-  return `'${value.replace(/\\/g, "/").replace(/'/g, "''")}'`;
+  // A backslash is a separator on Windows only: it is a legal filename character elsewhere.
+  const normalized = path.sep === "\\" ? value.replace(/\\/g, "/") : value;
+  return `'${normalized.replace(/'/g, "''")}'`;
+}
+
+// read_csv_auto and read_parquet expand glob patterns, unlike ATTACH.
+function escapeGlob(value: string): string {
+  return value.replace(/[[*?]/g, (character) => `[${character}]`);
 }
 
 function rowsAsObjects(rows: object[]): Record<string, unknown>[] {

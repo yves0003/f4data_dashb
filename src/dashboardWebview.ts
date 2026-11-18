@@ -19,6 +19,7 @@ export class DashboardWebviewManager {
     if (!fs.existsSync(path.join(vuePath, "index.html"))) {
       throw new Error(translate(this.language, "dashboardNotReady"));
     }
+    const dataWatchPatterns = this.duckDb.getDataWatchPatterns(resolvedPath);
     const panel = vscode.window.createWebviewPanel(
       "f4datadashb.dashboard",
       title,
@@ -34,8 +35,10 @@ export class DashboardWebviewManager {
     const vueWatcher = vscode.workspace.createFileSystemWatcher(
       new vscode.RelativePattern(vscode.Uri.file(vuePath), "**/*")
     );
-    const dataWatcher = vscode.workspace.createFileSystemWatcher(
-      new vscode.RelativePattern(vscode.Uri.file(dataPath), "**/*")
+    const dataWatchers = dataWatchPatterns.map(({ basePath, pattern }) =>
+      vscode.workspace.createFileSystemWatcher(
+        new vscode.RelativePattern(vscode.Uri.file(basePath), pattern)
+      )
     );
 
     const updateHtml = (): void => {
@@ -60,30 +63,24 @@ export class DashboardWebviewManager {
       }
     };
 
+    const invalidateData = (): void => {
+      this.duckDb.invalidate(resolvedPath);
+      if (ready) {
+        void sendInitialData(true);
+      }
+    };
+
     const subscriptions: vscode.Disposable[] = [
       vueWatcher,
-      dataWatcher,
+      ...dataWatchers,
       vueWatcher.onDidChange(updateHtml),
       vueWatcher.onDidCreate(updateHtml),
       vueWatcher.onDidDelete(updateHtml),
-      dataWatcher.onDidChange(() => {
-        this.duckDb.invalidate(resolvedPath);
-        if (ready) {
-          void sendInitialData(true);
-        }
-      }),
-      dataWatcher.onDidCreate(() => {
-        this.duckDb.invalidate(resolvedPath);
-        if (ready) {
-          void sendInitialData(true);
-        }
-      }),
-      dataWatcher.onDidDelete(() => {
-        this.duckDb.invalidate(resolvedPath);
-        if (ready) {
-          void sendInitialData(true);
-        }
-      }),
+      ...dataWatchers.flatMap((watcher) => [
+        watcher.onDidChange(invalidateData),
+        watcher.onDidCreate(invalidateData),
+        watcher.onDidDelete(invalidateData)
+      ]),
       panel.webview.onDidReceiveMessage(async (message: unknown) => {
         if (!isWebviewMessage(message)) {
           return;
