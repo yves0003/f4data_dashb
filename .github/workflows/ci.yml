@@ -65,7 +65,8 @@ jobs:
         run: npm ci
 
       - name: Create package output directory
-        run: node -e "require('node:fs').mkdirSync('package', { recursive: true })"
+        run: |
+          node -e 'require("node:fs").mkdirSync("package", { recursive: true })'
 
       - name: Package VS Code extension
         run: npx @vscode/vsce package --target ${{ matrix.target }} --out package/f4datadashb-${{ matrix.target }}.vsix
