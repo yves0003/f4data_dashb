@@ -12,6 +12,36 @@ function createDashboard(root) {
   return dashboard;
 }
 
+test("returns all rows by default and when maxRows is zero", async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "f4data-query-unlimited-"));
+  const dashboard = createDashboard(root);
+  const service = new DuckDbService();
+  try {
+    const defaultResult = await service.query(
+      dashboard,
+      "SELECT i FROM range(1000) AS values(i) ORDER BY i"
+    );
+    assert.equal(defaultResult.rows.length, 1000);
+    assert.equal(defaultResult.truncated, false);
+    assert.equal(defaultResult.maxRows, 0);
+
+    const explicitUnlimited = await service.query(
+      dashboard,
+      "SELECT i FROM range(1000) AS values(i) ORDER BY i",
+      false,
+      undefined,
+      undefined,
+      { maxRows: 0 }
+    );
+    assert.equal(explicitUnlimited.rows.length, 1000);
+    assert.equal(explicitUnlimited.truncated, false);
+    assert.equal(explicitUnlimited.maxRows, 0);
+  } finally {
+    await service.dispose();
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("returns only the configured query row limit and indicates truncation", async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "f4data-query-limit-"));
   const dashboard = createDashboard(root);

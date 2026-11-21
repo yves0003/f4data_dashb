@@ -17,6 +17,9 @@ import {
 } from "./localCopyService";
 
 export class DashboardWebviewManager {
+  private readonly panels = new Map<string, vscode.WebviewPanel>();
+  private readonly openingPanels = new Map<string, Promise<void>>();
+
   constructor(
     private readonly context: vscode.ExtensionContext,
     private readonly duckDb: DuckDbService,
@@ -26,6 +29,33 @@ export class DashboardWebviewManager {
 
   async open(dashboardPath: string, title: string): Promise<void> {
     const resolvedPath = path.resolve(dashboardPath);
+    const existingPanel = this.panels.get(resolvedPath);
+    if (existingPanel) {
+      existingPanel.title = title;
+      existingPanel.reveal(vscode.ViewColumn.Active);
+      return;
+    }
+
+    const openingPanel = this.openingPanels.get(resolvedPath);
+    if (openingPanel) {
+      await openingPanel;
+      const panel = this.panels.get(resolvedPath);
+      panel?.reveal(vscode.ViewColumn.Active);
+      return;
+    }
+
+    const opening = this.createPanel(resolvedPath, title);
+    this.openingPanels.set(resolvedPath, opening);
+    try {
+      await opening;
+    } finally {
+      if (this.openingPanels.get(resolvedPath) === opening) {
+        this.openingPanels.delete(resolvedPath);
+      }
+    }
+  }
+
+  private async createPanel(resolvedPath: string, title: string): Promise<void> {
     const vuePath = path.join(resolvedPath, "vue");
     const dataPath = path.join(resolvedPath, "data");
     if (!fs.existsSync(path.join(vuePath, "index.html"))) {
@@ -52,11 +82,13 @@ export class DashboardWebviewManager {
           localResourceRoots: [vscode.Uri.file(vuePath), vscode.Uri.file(dataPath)]
         }
       );
+      panel.iconPath = vscode.Uri.joinPath(this.context.extensionUri, "media", "icon.png");
     } catch (error) {
       await databaseLease?.dispose();
       await activeCopy?.dispose();
       throw error;
     }
+    this.panels.set(resolvedPath, panel);
     let ready = false;
     let disposed = false;
     const activeQueries = new Map<string, AbortController>();
@@ -315,6 +347,9 @@ export class DashboardWebviewManager {
       }),
       panel.onDidDispose(() => {
         disposed = true;
+        if (this.panels.get(resolvedPath) === panel) {
+          this.panels.delete(resolvedPath);
+        }
         if (sourceChangeTimer) {
           clearTimeout(sourceChangeTimer);
         }
@@ -537,9 +572,9 @@ function readPreviewRows(): number {
 }
 
 function readMaxRows(): number {
-  const value = vscode.workspace.getConfiguration("f4datadashb").get<unknown>("maxRows", 10_000);
-  if (typeof value !== "number" || !Number.isSafeInteger(value) || value < 1 || value > 100_000) {
-    throw new Error("f4datadashb.maxRows must be an integer between 1 and 100000");
+  const value = vscode.workspace.getConfiguration("f4datadashb").get<unknown>("maxRows", 0);
+  if (typeof value !== "number" || !Number.isSafeInteger(value) || value < 0 || value > 100_000) {
+    throw new Error("f4datadashb.maxRows must be 0 (unlimited) or an integer between 1 and 100000");
   }
   return value;
 }

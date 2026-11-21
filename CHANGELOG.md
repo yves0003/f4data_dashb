@@ -2,6 +2,31 @@
 
 ## Unreleased
 
+### Dashboard tabs
+
+- Reuse and reveal the existing dashboard Webview when its tree item is clicked again, including while its first opening is still in progress.
+- Pass the stable dashboard path to the row-open command instead of the transient TreeItem object, avoiding stale command arguments during repeated clicks and tree refreshes.
+- Show the extension logo on dashboard tabs.
+- Added a gear action in the dashboard view title to open this extension's settings.
+- Dashboard list items use the `screen-full` icon and switch to `screen-normal` while selected.
+
+### Dashboard documents
+
+- Added a separate Documents view below the dashboards view in the F4Data sidebar, grouping direct files in each dashboard's `Documents/` directory.
+- Opening a file uses VS Code's default editor. Nested directories are not traversed or listed.
+- Changes to the `Documents/` folder and its direct files refresh the view automatically.
+- Tests verify direct-file listing and exclusion of nested files and non-directory paths.
+
+### Dashboard favorites
+
+- Added a separate Favorites view backed by VS Code `globalState`; toggling the star on a dashboard adds or removes it from Favorites.
+- The main dashboard list keeps `screen-full` and `screen-normal` for its selection state. Favorites rows use `screen-full` and switch to `screen-normal` when selected.
+- Removing a dashboard from the imported list also removes it from Favorites.
+
+### Generated dashboard guide
+
+- Expanded newly generated `SKILL_GUIDE.md` files with guidance on validating SQL table/column names, handling dropped or changed schema, displaying request errors, limiting or paging large results, cancelling stale queries, and recovering after source changes.
+
 ### Optional local data copies
 
 - Added opt-in local snapshots for dashboards using `data/`. The default remains `off`.
@@ -30,7 +55,7 @@
 
 ### Query and Webview lifecycle limits
 
-- Added typed validation for incoming and outgoing dashboard messages, legacy request IDs, query cancellation via DuckDB connection interruption, and `f4datadashb.maxRows` (default 10,000; maximum 100,000).
+- Added typed validation for incoming and outgoing dashboard messages, legacy request IDs, query cancellation via DuckDB connection interruption, and configurable `f4datadashb.maxRows` (now unlimited by default; positive limits up to 100,000).
 - Added opt-in `f4datadashb.pauseWhenHidden` to cancel active queries and defer watcher refreshes while a dashboard is hidden.
 - Generated React and native HTML dashboards now cancel superseded queries, ignore stale responses, and indicate truncated results.
 - Tests verify bounded query results and active query interruption.

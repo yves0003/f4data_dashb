@@ -7,6 +7,47 @@ export interface DashboardInfo {
   description: string;
 }
 
+export interface DashboardDocument {
+  path: string;
+  name: string;
+}
+
+export function listDashboardDocuments(dashboardPath: string): DashboardDocument[] {
+  const documentsPath = path.join(normalizePath(dashboardPath), "Documents");
+  let directoryStat: fs.Stats;
+  try {
+    directoryStat = fs.statSync(documentsPath);
+  } catch (error) {
+    if (isMissingPathError(error)) {
+      return [];
+    }
+    throw error;
+  }
+  if (!directoryStat.isDirectory()) {
+    return [];
+  }
+  let entries: fs.Dirent[];
+  try {
+    entries = fs.readdirSync(documentsPath, { withFileTypes: true });
+  } catch (error) {
+    if (isMissingPathError(error)) {
+      return [];
+    }
+    throw error;
+  }
+  return entries
+    .filter((entry) => entry.isFile())
+    .map((entry) => ({
+      name: entry.name,
+      path: path.join(documentsPath, entry.name)
+    }))
+    .sort((left, right) => left.name.localeCompare(right.name));
+}
+
+function isMissingPathError(error: unknown): boolean {
+  return typeof error === "object" && error !== null && "code" in error && error.code === "ENOENT";
+}
+
 export function normalizePath(value: string): string {
   return path.normalize(path.resolve(value));
 }

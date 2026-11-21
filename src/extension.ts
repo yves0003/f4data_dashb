@@ -2,7 +2,12 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import * as vscode from "vscode";
 import { DashboardInfo, findDashboards, normalizePath, readDashboard } from "./dashboardService";
-import { DashboardTreeItem, DashboardTreeProvider } from "./dashboardTree";
+import {
+  DashboardFavoritesTreeProvider,
+  DashboardDocumentsTreeProvider,
+  DashboardTreeItem,
+  DashboardTreeProvider
+} from "./dashboardTree";
 import { DashboardWebviewManager } from "./dashboardWebview";
 import { DuckDbService } from "./duckdbService";
 import { translate } from "./i18n";
@@ -19,7 +24,42 @@ export function activate(context: vscode.ExtensionContext): void {
   const localCopies = new LocalCopyService();
   const webviews = new DashboardWebviewManager(context, duckDb, language, localCopies);
   const treeView = vscode.window.createTreeView("f4datadashb.dashboards", { treeDataProvider: tree });
-  context.subscriptions.push(treeView, tree);
+  const favoritesTree = new DashboardFavoritesTreeProvider(tree, language);
+  const favoritesView = vscode.window.createTreeView("f4datadashb.favorites", {
+    treeDataProvider: favoritesTree
+  });
+  context.subscriptions.push(
+    favoritesView.onDidChangeSelection(({ selection }) => {
+      const selected = selection[0];
+      favoritesTree.setSelectedDashboard(selected?.dashboard.path);
+    }),
+    treeView.onDidChangeSelection(({ selection }) => {
+      const selected = selection[0];
+      if (selected instanceof DashboardTreeItem) {
+        tree.setSelectedDashboard(selected.dashboard.path);
+        favoritesTree.setSelectedDashboard(selected.dashboard.path);
+      } else {
+        tree.setSelectedDashboard(undefined);
+        favoritesTree.setSelectedDashboard(undefined);
+      }
+    })
+  );
+  const documentsTree = new DashboardDocumentsTreeProvider(
+    context.globalState,
+    language,
+    tree.onDidChangeTreeData
+  );
+  const documentsView = vscode.window.createTreeView("f4datadashb.documents", {
+    treeDataProvider: documentsTree
+  });
+  context.subscriptions.push(
+    treeView,
+    tree,
+    favoritesView,
+    favoritesTree,
+    documentsView,
+    documentsTree
+  );
 
   try {
     const localCopyOptions = readLocalCopyOptions(vscode.workspace.getConfiguration("f4datadashb"));
@@ -133,6 +173,28 @@ export function activate(context: vscode.ExtensionContext): void {
         void vscode.window.showErrorMessage(t("removeFailed", errorMessage(error)));
       }
     }),
+    vscode.commands.registerCommand("f4datadashb.addFavorite", async (item?: DashboardTreeItem) => {
+      if (!item?.dashboard) {
+        return;
+      }
+      try {
+        if (!tree.isFavorite(item.dashboard.path)) {
+          await tree.toggleFavorite(item.dashboard.path);
+        }
+      } catch (error) {
+        void vscode.window.showErrorMessage(t("favoriteUpdateFailed", errorMessage(error)));
+      }
+    }),
+    vscode.commands.registerCommand("f4datadashb.removeFavorite", async (item?: DashboardTreeItem) => {
+      if (!item?.dashboard) {
+        return;
+      }
+      try {
+        await tree.removeFavorite(item.dashboard.path);
+      } catch (error) {
+        void vscode.window.showErrorMessage(t("favoriteUpdateFailed", errorMessage(error)));
+      }
+    }),
     vscode.commands.registerCommand("f4datadashb.clearLocalCopies", async () => {
       try {
         const removed = localCopies.clearUnusedCopies();
@@ -152,13 +214,21 @@ export function activate(context: vscode.ExtensionContext): void {
         void vscode.window.showErrorMessage(t("releaseDatabaseFailed", errorMessage(error)));
       }
     }),
-    vscode.commands.registerCommand("f4datadashb.openDashboard", async (item?: DashboardTreeItem) => {
-      const dashboard = item?.dashboard;
-      if (!dashboard) {
+    vscode.commands.registerCommand("f4datadashb.openSettings", async () => {
+      await vscode.commands.executeCommand(
+        "workbench.action.openSettings",
+        "@ext:yves0003.f4datadashb"
+      );
+    }),
+    vscode.commands.registerCommand("f4datadashb.openDashboard", async (argument?: unknown) => {
+      const dashboardPath = getDashboardPathArgument(argument);
+      if (!dashboardPath) {
         return;
       }
+      let dashboardName = path.basename(dashboardPath);
       try {
-        const current = readDashboard(dashboard.path);
+        const current = readDashboard(dashboardPath);
+        dashboardName = current.displayName;
         await webviews.open(current.path, current.displayName);
       } catch (error) {
         const reason = error instanceof Error && error.message.startsWith("invalid-package:")
@@ -166,7 +236,7 @@ export function activate(context: vscode.ExtensionContext): void {
           : error instanceof Error && error.message === "invalid-dashboard"
             ? t("invalidDashboard")
             : errorMessage(error);
-        void vscode.window.showErrorMessage(t("openFailed", dashboard.displayName, reason));
+        void vscode.window.showErrorMessage(t("openFailed", dashboardName, reason));
       }
     })
   );
@@ -784,6 +854,8 @@ Par défaut, les fichiers CSV, TSV, Parquet et DuckDB directement placés dans \
 
 Les chemins relatifs sont résolus depuis la racine du dashboard. Dès que la propriété \`dataSources\` existe, elle est prioritaire et le dossier \`data/\` n’est pas parcouru. Supprimez cette propriété pour revenir au mode automatique.
 
+Les noms SQL dépendent de la configuration : les fichiers CSV/TSV/Parquet sont exposés comme vues portant le nom de la source, et les bases DuckDB sont attachées sous leur alias. Vérifiez le nom réel des tables et colonnes avant de construire une requête. Dans une base DuckDB, vous pouvez inspecter les tables avec \`SHOW ALL TABLES\`; les colonnes d’une table se vérifient avec \`DESCRIBE SELECT * FROM "warehouse".main."ma_table"\`.
+
 ## Démarrage
 
 ${workflowGuide}
@@ -792,20 +864,24 @@ ${workflowGuide}
 
 La présence de \`acquireVsCodeApi()\` indique l’exécution dans une Webview VS Code. Appelez cette fonction une seule fois et conservez son résultat. Dans le navigateur, utilisez un pont facultatif ou des données de démonstration : ne supposez pas que l’API VS Code existe.
 
-Dans la Webview, écoutez les messages \`window.addEventListener("message", ...)\` et envoyez les commandes avec \`vscode.postMessage(...)\`. Envoyez \`{ command: "ready" }\` après l’installation du gestionnaire d’événements. L’extension répond avec \`{ command: "initData", data }\`. La commande \`refresh\` recharge les données et \`runQuery\` exécute une requête DuckDB ; les réponses sont \`queryResult\` ou \`queryError\`.
+Dans la Webview, écoutez les messages \`window.addEventListener("message", ...)\` et envoyez les commandes avec \`vscode.postMessage(...)\`. Appelez \`acquireVsCodeApi()\` une seule fois. Envoyez \`{ command: "ready" }\` après l’installation du gestionnaire d’événements. L’extension répond avec \`{ command: "initData", data }\`. La commande \`refresh\` recharge les données et \`runQuery\` exécute une requête DuckDB ; les réponses sont \`queryResult\` ou \`queryError\`.
 
-La communication est bidirectionnelle : l’extension envoie les données et résultats à la Webview, et l’interface demande des actualisations ou des requêtes à l’extension. Envoyez \`{ command: "runQuery", requestId, sql }\` pour exécuter une requête, puis \`{ command: "cancelQuery", requestId }\` pour l’annuler. Les résultats incluent \`columns\`, \`rows\`, \`truncated\` et \`maxRows\`; les requêtes sont limitées par le paramètre \`f4datadashb.maxRows\`. Vérifiez les messages reçus et n’envoyez pas de données non sérialisables.
+La communication est bidirectionnelle : l’extension envoie les données et résultats à la Webview, et l’interface demande des actualisations ou des requêtes à l’extension. Chaque \`runQuery\` doit avoir un \`requestId\` unique. Les résultats incluent \`columns\`, \`rows\`, \`truncated\` et \`maxRows\`; les erreurs arrivent dans \`queryError\` avec le même \`requestId\`. Affichez les erreurs de requête et gardez les erreurs distinctes d’un résultat vide ou d’un aperçu. Ignorez les réponses dont le \`requestId\` ne correspond plus à la requête active.
+
+Le paramètre \`f4datadashb.maxRows\` vaut \`0\` par défaut, donc une requête peut renvoyer toutes ses lignes. Une valeur de \`1\` à \`100000\` borne chaque réponse; \`truncated: true\` signifie que d’autres lignes existent. Les gros résultats illimités peuvent consommer beaucoup de mémoire et ralentir VS Code. Préférez les agrégations DuckDB ou la pagination; pour paginer, utilisez un tri stable avec une clé unique et un \`LIMIT\`, puis demandez la page suivante plutôt que de conserver tout le jeu de données dans l’état du front-end. Annulez une requête remplacée ou devenue inutile avec \`{ command: "cancelQuery", requestId }\`.
+
+Une table ou une colonne renommée ou supprimée rend les requêtes qui la référencent invalides : DuckDB répond par \`queryError\`. Ne supposez pas que le schéma reste constant; inspectez-le à nouveau, adaptez la requête et proposez une action de réessai. Si la source change pendant l’utilisation, l’extension invalide ses caches et actualise l’aperçu quand le changement est détecté. Avec une copie locale activée, l’interface continue d’utiliser l’instantané courant jusqu’à ce que l’utilisateur choisisse **Mettre à jour la copie locale**.
 
 ## États d’interface obligatoires
 
 Toute vue de données doit présenter clairement ces quatre états :
 
-1. **Chargement** : requête ou initialisation en cours.
-2. **Erreur** : erreur de lecture ou de requête affichée avec une action de récupération.
+1. **Chargement** : requête ou initialisation en cours; indiquez l’activité et évitez les doubles soumissions.
+2. **Erreur** : erreur de lecture ou de requête affichée clairement avec une action de récupération (réessayer, actualiser ou corriger la requête).
 3. **Vide** : aucune donnée disponible, avec une indication sur la manière d’en ajouter.
 4. **Nominal** : visualisation des données et accès aux actions utiles.
 
-Conservez ces états lors de toute évolution du dashboard, y compris pour les vues alimentées par une requête utilisateur.
+Conservez ces états lors de toute évolution du dashboard, y compris pour les vues alimentées par une requête utilisateur. Distinguez une table absente, une requête sans résultat et l’absence de fichiers sources. Pour les résultats tronqués, signalez la limite et fournissez une manière de parcourir les pages. Rendez les contrôles clavier accessibles, étiquetez les champs de requête, et évitez de bloquer l’interface pendant les traitements.
 `;
 }
 
@@ -821,4 +897,25 @@ function escapeHtml(value: string): string {
 
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
+}
+
+function getDashboardPathArgument(argument: unknown): string | undefined {
+  if (typeof argument === "string" && argument.trim()) {
+    return argument;
+  }
+  if (typeof argument !== "object" || argument === null) {
+    return undefined;
+  }
+  if ("dashboard" in argument) {
+    const dashboard = argument.dashboard;
+    return typeof dashboard === "object" &&
+      dashboard !== null &&
+      "path" in dashboard &&
+      typeof dashboard.path === "string"
+      ? dashboard.path
+      : undefined;
+  }
+  return "path" in argument && typeof argument.path === "string"
+    ? argument.path
+    : undefined;
 }

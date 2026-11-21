@@ -22,6 +22,10 @@ The importer accepts a dashboard folder directly or scans only its immediate chi
 
 Open the **F4Data Dashboards** view from the Activity Bar. Use its **+** action to create a dashboard, or its import action to add an existing dashboard. You can also right-click a folder in the VS Code Explorer and choose **Initialize F4Data Dashboard in This Folder**. Select a dashboard in the view to open it; removing it from the view does not delete its files.
 
+The **Favorites** view shows dashboards marked with the star action beside their row. Favorites are saved in VS Code `globalState`. The dashboard list keeps `screen-full`/`screen-normal` for its open-selection state. In the Favorites view, dashboards show `screen-full`, switching to `screen-normal` when selected. Removing a dashboard from the imported dashboard list also removes it from Favorites.
+
+The **Documents** view is a separate section in the F4Data sidebar, below the dashboards view. For each dashboard, it lists and opens regular files found directly in that dashboard's `Documents/` folder. Subfolders and their contents are intentionally ignored. Create `Documents/` if it does not exist; its contents refresh automatically as files are added, changed, or removed.
+
 ## Generated dashboard projects
 
 The create command first lets you choose a React or native HTML/CSS/JavaScript template, then initializes the folder you select directly (it does not create a child folder). You can also right-click a folder in the VS Code Explorer and choose **Initialize F4Data Dashboard in This Folder**; that command offers the same template choices. It merges the selected framework's scripts and dependencies into an existing `package.json` and preserves unrelated manifest fields. Existing generated files prompt before replacement.
@@ -92,6 +96,6 @@ Initial column names are obtained with `DESCRIBE`; an optional sample is then fe
 
 Query results and initial previews share an 8 MiB byte-bounded LRU cache. Oversized individual results are returned but not cached, and concurrent identical operations share the same in-flight DuckDB work.
 
-Dashboard queries are streamed up to `f4datadashb.maxRows` (default `10000`, maximum `100000`); responses indicate whether they were truncated. A dashboard can send `cancelQuery` with the matching `requestId` to interrupt a running query. The optional `f4datadashb.pauseWhenHidden` setting (default `false`) cancels active queries and defers watcher-driven refreshes while its Webview is hidden, then refreshes when it becomes visible.
+Dashboard queries return all rows by default. Set `f4datadashb.maxRows` to a positive number (up to `100000`) to limit each query result; `0` means unlimited. Limited responses indicate whether they were truncated. Large unlimited results can consume significant memory and affect VS Code responsiveness, so consider setting a limit for large datasets. A dashboard can send `cancelQuery` with the matching `requestId` to interrupt a running query. The optional `f4datadashb.pauseWhenHidden` setting (default `false`) cancels active queries and defers watcher-driven refreshes while its Webview is hidden, then refreshes when it becomes visible.
 
 Source fingerprints include file identity and change times as well as size and modification time, so atomically replacing a data file invalidates stale query and session caches even when its size and modification time are preserved. Concurrent VS Code windows can share a completed local copy; a competing copy operation verifies and leases the winner rather than failing on publication.

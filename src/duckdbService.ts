@@ -196,13 +196,14 @@ export class DuckDbService {
   ): Promise<QueryCacheEntry> {
     if (
       queryOptions.maxRows !== undefined &&
-      (!Number.isSafeInteger(queryOptions.maxRows) || queryOptions.maxRows < 1 || queryOptions.maxRows > 100_000)
+      (!Number.isSafeInteger(queryOptions.maxRows) || queryOptions.maxRows < 0 || queryOptions.maxRows > 100_000)
     ) {
-      throw new Error("DuckDB query maxRows must be an integer between 1 and 100000");
+      throw new Error("DuckDB query maxRows must be 0 (unlimited) or an integer between 1 and 100000");
     }
+    const maxRows = queryOptions.maxRows === 0 ? undefined : queryOptions.maxRows;
     const files = resolveDataFiles(dashboardPath, dataRootOverride);
     const fingerprint = getFingerprint(files);
-    const key = `${dashboardCacheKey(dashboardPath, dataRootOverride)}\0query:${queryOptions.maxRows ?? "all"}:${sql.trim()}`;
+    const key = `${dashboardCacheKey(dashboardPath, dataRootOverride)}\0query:${maxRows ?? "all"}:${sql.trim()}`;
     const cached = !force ? this.getCached<QueryCacheEntry>(key, fingerprint) : undefined;
     if (cached) {
       return cached;
@@ -211,13 +212,13 @@ export class DuckDbService {
     const generation = this.cacheGeneration(dashboardPath);
     const executeQuery = async (): Promise<QueryCacheEntry> => {
       const result = await this.withDatabase(files, async (connection) => {
-        return readQuery(connection, sql, queryOptions.maxRows, queryOptions.signal);
+        return readQuery(connection, sql, maxRows, queryOptions.signal);
       }, dashboardPath, dataRootOverride, sessionOptions);
       const entry = {
         fingerprint,
         ...result,
         truncated: result.truncated === true,
-        maxRows: queryOptions.maxRows ?? result.rows.length
+        maxRows: maxRows ?? 0
       };
       if (!queryOptions.signal?.aborted && this.cacheGeneration(dashboardPath) === generation) {
         this.setCached(key, fingerprint, entry);
