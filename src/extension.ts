@@ -6,15 +6,26 @@ import { DashboardTreeItem, DashboardTreeProvider } from "./dashboardTree";
 import { DashboardWebviewManager } from "./dashboardWebview";
 import { DuckDbService } from "./duckdbService";
 import { translate } from "./i18n";
+import { LocalCopyService, readLocalCopyOptions } from "./localCopyService";
 
 export function activate(context: vscode.ExtensionContext): void {
   const language = vscode.env.language;
   const t = (key: Parameters<typeof translate>[1], ...values: string[]) => translate(language, key, ...values);
   const tree = new DashboardTreeProvider(context.globalState, language);
   const duckDb = new DuckDbService();
-  const webviews = new DashboardWebviewManager(context, duckDb, language);
+  const localCopies = new LocalCopyService();
+  const webviews = new DashboardWebviewManager(context, duckDb, language, localCopies);
   const treeView = vscode.window.createTreeView("f4datadashb.dashboards", { treeDataProvider: tree });
   context.subscriptions.push(treeView, tree);
+
+  try {
+    const localCopyOptions = readLocalCopyOptions(vscode.workspace.getConfiguration("f4datadashb"));
+    if (localCopyOptions.mode !== "off") {
+      localCopies.purge(localCopyOptions.keep);
+    }
+  } catch (error) {
+    void vscode.window.showErrorMessage(t("localCopyFailed", errorMessage(error)));
+  }
 
   void tree.refresh().then((invalidCount) => {
     if (invalidCount > 0) {
@@ -119,6 +130,14 @@ export function activate(context: vscode.ExtensionContext): void {
         void vscode.window.showErrorMessage(t("removeFailed", errorMessage(error)));
       }
     }),
+    vscode.commands.registerCommand("f4datadashb.clearLocalCopies", async () => {
+      try {
+        const removed = localCopies.clearUnusedCopies();
+        void vscode.window.showInformationMessage(t("localCopiesCleared", String(removed)));
+      } catch (error) {
+        void vscode.window.showErrorMessage(t("localCopyFailed", errorMessage(error)));
+      }
+    }),
     vscode.commands.registerCommand("f4datadashb.openDashboard", async (item?: DashboardTreeItem) => {
       const dashboard = item?.dashboard;
       if (!dashboard) {
@@ -126,7 +145,7 @@ export function activate(context: vscode.ExtensionContext): void {
       }
       try {
         const current = readDashboard(dashboard.path);
-        webviews.open(current.path, current.displayName);
+        await webviews.open(current.path, current.displayName);
       } catch (error) {
         const reason = error instanceof Error && error.message.startsWith("invalid-package:")
           ? t("invalidPackage", error.message.slice("invalid-package:".length))

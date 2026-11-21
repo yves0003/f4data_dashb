@@ -22,7 +22,8 @@
     "onCommand:f4datadashb.createDashboard",
     "onCommand:f4datadashb.generateDashboardInFolder",
     "onCommand:f4datadashb.removeDashboard",
-    "onCommand:f4datadashb.openDashboard"
+    "onCommand:f4datadashb.openDashboard",
+    "onCommand:f4datadashb.clearLocalCopies"
   ],
   "main": "./out/extension.js",
   "contributes": {
@@ -72,8 +73,40 @@
         "command": "f4datadashb.openDashboard",
         "title": "%command.openDashboard%",
         "icon": "$(eye)"
+      },
+      {
+        "command": "f4datadashb.clearLocalCopies",
+        "title": "%command.clearLocalCopies%"
       }
     ],
+    "configuration": {
+      "title": "%configuration.title%",
+      "properties": {
+        "f4datadashb.localCopy": {
+          "type": "string",
+          "enum": ["off", "auto", "always"],
+          "default": "off",
+          "description": "%setting.localCopy.description%",
+          "enumDescriptions": [
+            "%setting.localCopy.off%",
+            "%setting.localCopy.auto%",
+            "%setting.localCopy.always%"
+          ]
+        },
+        "f4datadashb.localCopyThresholdMb": {
+          "type": "number",
+          "minimum": 0,
+          "default": 50,
+          "description": "%setting.localCopyThresholdMb.description%"
+        },
+        "f4datadashb.localCopyKeep": {
+          "type": "string",
+          "pattern": "^(session|days:[0-9]+)$",
+          "default": "days:7",
+          "description": "%setting.localCopyKeep.description%"
+        }
+      }
+    },
     "menus": {
       "explorer/context": [
         {
@@ -113,6 +146,7 @@
     "compile": "tsc -p ./",
     "watch": "tsc -watch -p ./",
     "check": "tsc --noEmit -p ./",
+    "test": "npm run compile && node --test",
     "package:extension": "node -e \"require('node:fs').mkdirSync('package', { recursive: true })\" && vsce package --out package/f4datadashb-0.0.17.vsix"
   },
   "dependencies": {

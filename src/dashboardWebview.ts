@@ -4,31 +4,46 @@ import * as path from "node:path";
 import * as vscode from "vscode";
 import { DuckDbService } from "./duckdbService";
 import { MessageKey, translate } from "./i18n";
+import {
+  InsufficientCopySpaceError,
+  LocalCopyLease,
+  LocalCopyService,
+  readLocalCopyOptions
+} from "./localCopyService";
 
 export class DashboardWebviewManager {
   constructor(
     private readonly context: vscode.ExtensionContext,
     private readonly duckDb: DuckDbService,
-    private readonly language: string
+    private readonly language: string,
+    private readonly localCopies: LocalCopyService
   ) {}
 
-  open(dashboardPath: string, title: string): void {
+  async open(dashboardPath: string, title: string): Promise<void> {
     const resolvedPath = path.resolve(dashboardPath);
     const vuePath = path.join(resolvedPath, "vue");
     const dataPath = path.join(resolvedPath, "data");
     if (!fs.existsSync(path.join(vuePath, "index.html"))) {
       throw new Error(translate(this.language, "dashboardNotReady"));
     }
-    const dataWatchPatterns = this.duckDb.getDataWatchPatterns(resolvedPath);
-    const panel = vscode.window.createWebviewPanel(
-      "f4datadashb.dashboard",
-      title,
-      vscode.ViewColumn.One,
-      {
-        enableScripts: true,
-        localResourceRoots: [vscode.Uri.file(vuePath), vscode.Uri.file(dataPath)]
-      }
-    );
+    let activeCopy = await this.prepareLocalCopy(resolvedPath);
+    let activeDataPath = activeCopy?.dataPath;
+    const dataWatchPatterns = this.duckDb.getDataWatchPatterns(resolvedPath, activeDataPath);
+    let panel: vscode.WebviewPanel;
+    try {
+      panel = vscode.window.createWebviewPanel(
+        "f4datadashb.dashboard",
+        title,
+        vscode.ViewColumn.One,
+        {
+          enableScripts: true,
+          localResourceRoots: [vscode.Uri.file(vuePath), vscode.Uri.file(dataPath)]
+        }
+      );
+    } catch (error) {
+      await activeCopy?.dispose();
+      throw error;
+    }
     let ready = false;
     let disposed = false;
 
@@ -56,7 +71,7 @@ export class DashboardWebviewManager {
 
     const sendInitialData = async (force: boolean): Promise<void> => {
       try {
-        const data = await this.duckDb.loadInitialData(resolvedPath, force);
+        const data = await this.duckDb.loadInitialData(resolvedPath, force, activeDataPath);
         await panel.webview.postMessage({ command: "initData", data });
       } catch (error) {
         await this.sendError(panel.webview, error);
@@ -64,18 +79,73 @@ export class DashboardWebviewManager {
     };
 
     const invalidateData = (): void => {
-      this.duckDb.invalidate(resolvedPath);
+      this.duckDb.invalidate(resolvedPath, activeDataPath);
       if (ready) {
         void sendInitialData(true);
       }
     };
 
+    const refreshLocalCopy = async (): Promise<void> => {
+      const nextCopy = await this.prepareLocalCopy(resolvedPath, true);
+      if (!nextCopy || disposed) {
+        await nextCopy?.dispose();
+        return;
+      }
+      const previousCopy = activeCopy;
+      activeCopy = nextCopy;
+      activeDataPath = nextCopy.dataPath;
+      this.duckDb.invalidate(resolvedPath);
+      await previousCopy?.dispose();
+      if (ready) {
+        await sendInitialData(true);
+      }
+    };
+
+    let sourceChangeTimer: NodeJS.Timeout | undefined;
+    let updatePromptOpen = false;
+    const sourceWatcher = activeCopy
+      ? vscode.workspace.createFileSystemWatcher(
+        new vscode.RelativePattern(vscode.Uri.file(dataPath), "**/*")
+      )
+      : undefined;
+    const promptForCopyUpdate = async (): Promise<void> => {
+      if (!activeCopy || updatePromptOpen || disposed) {
+        return;
+      }
+      updatePromptOpen = true;
+      try {
+        const action = await vscode.window.showInformationMessage(
+          translate(this.language, "localCopySourceChanged"),
+          translate(this.language, "updateLocalCopy")
+        );
+        if (action === translate(this.language, "updateLocalCopy")) {
+          await refreshLocalCopy();
+        }
+      } finally {
+        updatePromptOpen = false;
+      }
+    };
+    const scheduleCopyUpdatePrompt = (): void => {
+      if (sourceChangeTimer) {
+        clearTimeout(sourceChangeTimer);
+      }
+      sourceChangeTimer = setTimeout(() => {
+        void promptForCopyUpdate();
+      }, 1000);
+    };
+
     const subscriptions: vscode.Disposable[] = [
       vueWatcher,
       ...dataWatchers,
+      ...(sourceWatcher ? [sourceWatcher] : []),
       vueWatcher.onDidChange(updateHtml),
       vueWatcher.onDidCreate(updateHtml),
       vueWatcher.onDidDelete(updateHtml),
+      ...(sourceWatcher ? [
+        sourceWatcher.onDidChange(scheduleCopyUpdatePrompt),
+        sourceWatcher.onDidCreate(scheduleCopyUpdatePrompt),
+        sourceWatcher.onDidDelete(scheduleCopyUpdatePrompt)
+      ] : []),
       ...dataWatchers.flatMap((watcher) => [
         watcher.onDidChange(invalidateData),
         watcher.onDidCreate(invalidateData),
@@ -91,13 +161,18 @@ export class DashboardWebviewManager {
           return;
         }
         if (message.command === "refresh") {
-          this.duckDb.invalidate(resolvedPath);
+          this.duckDb.invalidate(resolvedPath, activeDataPath);
           await sendInitialData(true);
           return;
         }
         if (message.command === "runQuery" && typeof message.sql === "string") {
           try {
-            const result = await this.duckDb.query(resolvedPath, message.sql, message.force === true);
+            const result = await this.duckDb.query(
+              resolvedPath,
+              message.sql,
+              message.force === true,
+              activeDataPath
+            );
             await panel.webview.postMessage({
               command: "queryResult",
               requestId: message.requestId,
@@ -115,6 +190,14 @@ export class DashboardWebviewManager {
       }),
       panel.onDidDispose(() => {
         disposed = true;
+        if (sourceChangeTimer) {
+          clearTimeout(sourceChangeTimer);
+        }
+        void activeCopy?.dispose().catch((error: unknown) => {
+          void vscode.window.showErrorMessage(
+            translate(this.language, "localCopyFailed", errorMessage(error))
+          );
+        });
         for (const subscription of subscriptions) {
           subscription.dispose();
         }
@@ -129,6 +212,53 @@ export class DashboardWebviewManager {
         }
       }
     });
+  }
+
+  private async prepareLocalCopy(
+    dashboardPath: string,
+    retry = false
+  ): Promise<LocalCopyLease | undefined> {
+    const options = readLocalCopyOptions(vscode.workspace.getConfiguration("f4datadashb"));
+    if (options.mode === "off") {
+      return undefined;
+    }
+    while (true) {
+      try {
+        return await vscode.window.withProgress({
+          location: vscode.ProgressLocation.Notification,
+          title: translate(this.language, "preparingLocalCopy"),
+          cancellable: true
+        }, (progress, token) => this.localCopies.prepare(
+          dashboardPath,
+          options,
+          {
+            report: (message, increment) => progress.report({ message, increment })
+          },
+          token
+        ));
+      } catch (error) {
+        if (error instanceof InsufficientCopySpaceError) {
+          void vscode.window.showErrorMessage(translate(
+            this.language,
+            "localCopyInsufficientSpace",
+            formatBytes(error.requiredBytes),
+            formatBytes(error.availableBytes)
+          ));
+          return undefined;
+        }
+        const retryAction = translate(this.language, "retryLocalCopy");
+        const fallbackAction = translate(this.language, "useNetworkSource");
+        const action = await vscode.window.showErrorMessage(
+          translate(this.language, "localCopyFailed", errorMessage(error)),
+          retryAction,
+          fallbackAction
+        );
+        if (action !== retryAction || retry) {
+          return undefined;
+        }
+        retry = true;
+      }
+    }
   }
 
   private renderHtml(webview: vscode.Webview, vuePath: string): string {
@@ -187,4 +317,8 @@ function getNonce(): string {
 
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
+}
+
+function formatBytes(bytes: number): string {
+  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
 }

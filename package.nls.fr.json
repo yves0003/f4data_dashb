@@ -8,5 +8,13 @@
   "command.createDashboard": "Créer un tableau de bord",
   "command.generateDashboardInFolder": "Générer un tableau de bord F4Data dans ce dossier",
   "command.removeDashboard": "Retirer le tableau de bord",
-  "command.openDashboard": "Ouvrir le tableau de bord"
+  "command.openDashboard": "Ouvrir le tableau de bord",
+  "command.clearLocalCopies": "Vider les copies locales inutilisées",
+  "configuration.title": "Tableaux de bord F4Data",
+  "setting.localCopy.description": "Créer un instantané local des données du tableau de bord avant de l’ouvrir.",
+  "setting.localCopy.off": "Utiliser les données à leur emplacement configuré sans créer de copie locale.",
+  "setting.localCopy.auto": "Copier les données uniquement si elles sont sur un système de fichiers réseau détecté et dépassent le seuil.",
+  "setting.localCopy.always": "Créer une copie locale lorsque le dashboard utilise le dossier conventionnel data/.",
+  "setting.localCopyThresholdMb.description": "Taille minimale de data/ en mégaoctets pour que le mode automatique copie une source réseau détectée.",
+  "setting.localCopyKeep.description": "Conserver les copies pendant la session VS Code ou pendant N jours après la dernière utilisation (ex. days:7)."
 }

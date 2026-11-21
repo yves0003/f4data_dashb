@@ -42,10 +42,15 @@ export class DuckDbService {
   private readonly cache = new Map<string, Map<string, QueryCacheEntry>>();
   private readonly initialCache = new Map<string, { fingerprint: string; data: InitialData }>();
 
-  async loadInitialData(dashboardPath: string, force = false): Promise<InitialData> {
-    const files = resolveDataFiles(dashboardPath);
+  async loadInitialData(
+    dashboardPath: string,
+    force = false,
+    dataRootOverride?: string
+  ): Promise<InitialData> {
+    const files = resolveDataFiles(dashboardPath, dataRootOverride);
     const fingerprint = getFingerprint(files);
-    const cached = !force ? this.initialCache.get(path.resolve(dashboardPath)) : undefined;
+    const cacheKey = dashboardCacheKey(dashboardPath, dataRootOverride);
+    const cached = !force ? this.initialCache.get(cacheKey) : undefined;
     if (cached?.fingerprint === fingerprint) {
       return JSON.parse(JSON.stringify(cached.data)) as InitialData;
     }
@@ -97,14 +102,19 @@ export class DuckDbService {
       files: files.map((file) => file.alias ? `${file.alias} (${file.name})` : file.name),
       datasets
     };
-    this.initialCache.set(path.resolve(dashboardPath), { fingerprint, data });
+    this.initialCache.set(cacheKey, { fingerprint, data });
     return data;
   }
 
-  async query(dashboardPath: string, sql: string, force = false): Promise<QueryCacheEntry> {
-    const files = resolveDataFiles(dashboardPath);
+  async query(
+    dashboardPath: string,
+    sql: string,
+    force = false,
+    dataRootOverride?: string
+  ): Promise<QueryCacheEntry> {
+    const files = resolveDataFiles(dashboardPath, dataRootOverride);
     const fingerprint = getFingerprint(files);
-    const cache = this.dashboardCache(dashboardPath);
+    const cache = this.dashboardCache(dashboardPath, dataRootOverride);
     const key = sql.trim();
     const cached = !force ? cache.get(key) : undefined;
     if (cached?.fingerprint === fingerprint) {
@@ -125,23 +135,37 @@ export class DuckDbService {
     return { fingerprint, ...result };
   }
 
-  invalidate(dashboardPath: string): void {
-    const key = path.resolve(dashboardPath);
-    this.cache.delete(key);
-    this.initialCache.delete(key);
+  invalidate(dashboardPath: string, dataRootOverride?: string): void {
+    if (dataRootOverride) {
+      const key = dashboardCacheKey(dashboardPath, dataRootOverride);
+      this.cache.delete(key);
+      this.initialCache.delete(key);
+      return;
+    }
+    const prefix = `${path.resolve(dashboardPath)}\0`;
+    for (const key of this.cache.keys()) {
+      if (key.startsWith(prefix)) {
+        this.cache.delete(key);
+      }
+    }
+    for (const key of this.initialCache.keys()) {
+      if (key.startsWith(prefix)) {
+        this.initialCache.delete(key);
+      }
+    }
   }
 
-  getDataWatchPatterns(dashboardPath: string): DataWatchPattern[] {
-    const files = resolveDataFiles(dashboardPath);
+  getDataWatchPatterns(dashboardPath: string, dataRootOverride?: string): DataWatchPattern[] {
+    const files = resolveDataFiles(dashboardPath, dataRootOverride);
     const directories = new Set(files.map((file) => path.dirname(file.path)));
     if (files.length === 0 && !hasConfiguredDataSources(dashboardPath)) {
-      directories.add(path.resolve(dashboardPath, "data"));
+      directories.add(path.resolve(dataRootOverride ?? path.join(dashboardPath, "data")));
     }
     return [...directories].map((basePath) => ({ basePath, pattern: "**/*" }));
   }
 
-  private dashboardCache(dashboardPath: string): Map<string, QueryCacheEntry> {
-    const key = path.resolve(dashboardPath);
+  private dashboardCache(dashboardPath: string, dataRootOverride?: string): Map<string, QueryCacheEntry> {
+    const key = dashboardCacheKey(dashboardPath, dataRootOverride);
     let cache = this.cache.get(key);
     if (!cache) {
       cache = new Map();
@@ -209,7 +233,11 @@ function listDataFiles(dataPath: string): DataFile[] {
     .sort((left, right) => left.name.localeCompare(right.name));
 }
 
-function resolveDataFiles(dashboardPath: string): DataFile[] {
+function dashboardCacheKey(dashboardPath: string, dataRootOverride?: string): string {
+  return `${path.resolve(dashboardPath)}\0${dataRootOverride ? path.resolve(dataRootOverride) : ""}`;
+}
+
+function resolveDataFiles(dashboardPath: string, dataRootOverride?: string): DataFile[] {
   const resolvedDashboardPath = path.resolve(dashboardPath);
   const manifestPath = path.join(resolvedDashboardPath, "package.json");
   const parsedManifest: unknown = JSON.parse(fs.readFileSync(manifestPath, "utf8"));
@@ -219,7 +247,7 @@ function resolveDataFiles(dashboardPath: string): DataFile[] {
   const manifest = parsedManifest as Record<string, unknown>;
 
   if (!Object.prototype.hasOwnProperty.call(manifest, "dataSources")) {
-    return listDataFiles(path.join(resolvedDashboardPath, "data"));
+    return listDataFiles(dataRootOverride ?? path.join(resolvedDashboardPath, "data"));
   }
 
   if (!Array.isArray(manifest.dataSources)) {

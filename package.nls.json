@@ -8,5 +8,13 @@
   "command.createDashboard": "Create Dashboard",
   "command.generateDashboardInFolder": "Initialize F4Data Dashboard in This Folder",
   "command.removeDashboard": "Remove Dashboard",
-  "command.openDashboard": "Open Dashboard"
+  "command.openDashboard": "Open Dashboard",
+  "command.clearLocalCopies": "Clear Unused Local Data Copies",
+  "configuration.title": "F4Data Dashboards",
+  "setting.localCopy.description": "Create local snapshots of a dashboard's data before opening it.",
+  "setting.localCopy.off": "Use data from its configured location without creating a local copy.",
+  "setting.localCopy.auto": "Copy data only when it is on a detected network filesystem and meets the size threshold.",
+  "setting.localCopy.always": "Create a local copy whenever the dashboard uses the conventional data/ folder.",
+  "setting.localCopyThresholdMb.description": "Minimum data/ size in megabytes before auto mode copies a detected network source.",
+  "setting.localCopyKeep.description": "Keep local copies for this VS Code session, or for N days after last use (for example, days:7)."
 }

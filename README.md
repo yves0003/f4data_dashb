@@ -62,3 +62,17 @@ CSV/TSV/Parquet files are exposed to DuckDB as views named after the source (`"s
 For example, query a configured CSV view with `SELECT * FROM "sales"` or a table in the configured DuckDB file with `SELECT * FROM "warehouse".main.my_table`. Changing files in configured source directories invalidates the cache and refreshes the open dashboard.
 
 Initial data is sampled into the Webview, and dashboard requests can execute DuckDB SQL against the data views. Query results are cached by SQL and data-file fingerprint; changing a file invalidates the cache. Each operation closes its DuckDB connection and instance.
+
+## Optional local data copies
+
+The `f4datadashb.localCopy` setting is `off` by default, preserving the existing behavior. It applies to dashboards using the conventional `data/` directory; dashboards with a `dataSources` property continue to use those configured paths directly.
+
+- `off`: always read from the original location.
+- `auto`: copy `data/` only when its path is detected on a network filesystem and the total size is at least `f4datadashb.localCopyThresholdMb` (default `50`).
+- `always`: create a local copy for any conventional `data/` directory.
+
+DuckDB files are copied with DuckDB's read-only database-copy operation into a temporary local directory, then promoted only after the copy succeeds and a table row count has been checked. DuckDB handles any WAL state when it opens the source; a raw WAL sidecar is not paired with the new snapshot. Other files are streamed to temporary files, hashed, and renamed after completion. If copying is cancelled, the dashboard opens against the original data. Copy errors offer a retry or the option to use the original source. Ensure no external process is writing to a non-DuckDB data file while it is being copied.
+
+`f4datadashb.localCopyKeep` controls retention: `session` removes a snapshot when the last dashboard using it in that VS Code extension process closes; `days:N` (default `days:7`) keeps it for N days after last use so it can be reused. A PID lock protects snapshots used by another VS Code window. Old snapshots and stale locks are cleaned on startup when local copies are enabled. Use **F4Data Dashboards: Clear Unused Local Data Copies** to remove inactive copies manually; active copies are left alone.
+
+When a source changes while a dashboard is open, it keeps using its current snapshot and offers **Update local copy** instead of silently recopying a large database. The extension stores snapshots outside the dashboard and its data folder: in `%LOCALAPPDATA%` on Windows, `~/Library/Caches` on macOS, and `$XDG_CACHE_HOME` or `~/.cache` on Linux.
