@@ -65,6 +65,10 @@ interface SourceFile {
   relativePath: string;
   size: number;
   mtimeMs: number;
+  ctimeMs: number;
+  birthtimeMs: number;
+  dev: number;
+  ino: number;
 }
 
 interface CopyManifest {
@@ -77,6 +81,8 @@ interface CopyManifest {
 
 interface LockFile {
   pid: number;
+  host?: string;
+  createdAt?: number;
 }
 
 export class InsufficientCopySpaceError extends Error {
@@ -219,7 +225,7 @@ export class LocalCopyService {
           );
         }
         const afterCopy = fs.statSync(file.path);
-        if (afterCopy.size !== file.size || afterCopy.mtimeMs !== file.mtimeMs) {
+        if (!sameSourceVersion(afterCopy, file)) {
           throw new Error(`Source changed while it was being copied: ${file.relativePath}`);
         }
         completedBytes += file.size;
@@ -247,7 +253,18 @@ export class LocalCopyService {
         files: hashes
       };
       fs.writeFileSync(cachedManifestPathFor(stageRoot), JSON.stringify(manifest), "utf8");
-      fs.renameSync(stageRoot, versionRoot);
+      try {
+        fs.renameSync(stageRoot, versionRoot);
+      } catch (error) {
+        const code = isRecord(error) ? error.code : undefined;
+        if (
+          (code === "EEXIST" || code === "ENOTEMPTY" || code === "EPERM") &&
+          isReusableCopy(cachedManifestPath, fingerprint, sourceRoot, copyableFiles)
+        ) {
+          return this.createLease(versionRoot, path.join(versionRoot, "data"), options.keep);
+        }
+        throw error;
+      }
       return this.createLease(versionRoot, path.join(versionRoot, "data"), options.keep);
     } catch (error) {
       if (token.isCancellationRequested) {
@@ -342,7 +359,11 @@ export class LocalCopyService {
     const locksPath = path.join(versionRoot, LOCKS_FOLDER);
     fs.mkdirSync(locksPath, { recursive: true });
     const lockPath = path.join(locksPath, `${process.pid}-${randomUUID()}.json`);
-    fs.writeFileSync(lockPath, JSON.stringify({ pid: process.pid } satisfies LockFile), { flag: "wx" });
+    fs.writeFileSync(lockPath, JSON.stringify({
+      pid: process.pid,
+      host: os.hostname(),
+      createdAt: Date.now()
+    } satisfies LockFile), { flag: "wx" });
     const manifestPath = path.join(versionRoot, MANIFEST_FILE);
     const manifest = readCopyManifest(manifestPath);
     if (!manifest) {
@@ -482,7 +503,11 @@ function scanFiles(root: string): SourceFile[] {
           path: fullPath,
           relativePath: path.relative(root, fullPath),
           size: stat.size,
-          mtimeMs: stat.mtimeMs
+          mtimeMs: stat.mtimeMs,
+          ctimeMs: stat.ctimeMs,
+          birthtimeMs: stat.birthtimeMs,
+          dev: stat.dev,
+          ino: stat.ino
         });
       }
     }
@@ -494,9 +519,20 @@ function scanFiles(root: string): SourceFile[] {
 function getSourceFingerprint(files: SourceFile[]): string {
   const hash = createHash("sha256");
   for (const file of files) {
-    hash.update(`${file.relativePath}\0${file.size}\0${file.mtimeMs}\n`);
+    hash.update(
+      `${file.relativePath}\0${file.dev}\0${file.ino}\0${file.size}\0${file.mtimeMs}\0${file.ctimeMs}\0${file.birthtimeMs}\n`
+    );
   }
   return hash.digest("hex");
+}
+
+function sameSourceVersion(stat: fs.Stats, file: SourceFile): boolean {
+  return stat.size === file.size &&
+    stat.mtimeMs === file.mtimeMs &&
+    stat.ctimeMs === file.ctimeMs &&
+  stat.birthtimeMs === file.birthtimeMs &&
+    stat.dev === file.dev &&
+    stat.ino === file.ino;
 }
 
 function isReusableCopy(
@@ -691,14 +727,29 @@ function hasLiveLocks(versionRoot: string): boolean {
   let live = false;
   for (const lockName of fs.readdirSync(locksPath)) {
     const lockPath = path.join(locksPath, lockName);
-    let lock: LockFile | undefined;
+    let lock: LockFile;
     try {
-      lock = JSON.parse(fs.readFileSync(lockPath, "utf8")) as LockFile;
+      const parsed: unknown = JSON.parse(fs.readFileSync(lockPath, "utf8"));
+      if (
+        !isRecord(parsed) ||
+        typeof parsed.pid !== "number" ||
+        !Number.isInteger(parsed.pid)
+      ) {
+        throw new Error("Invalid local-copy lock file");
+      }
+      lock = {
+        pid: parsed.pid,
+        host: typeof parsed.host === "string" ? parsed.host : undefined
+      };
     } catch {
       fs.rmSync(lockPath, { force: true });
       continue;
     }
-    if (!Number.isInteger(lock.pid) || !isProcessAlive(lock.pid)) {
+    const host = lock.host ?? os.hostname();
+    if (
+      !Number.isInteger(lock.pid) ||
+      (host === os.hostname() && !isProcessAlive(lock.pid))
+    ) {
       fs.rmSync(lockPath, { force: true });
     } else {
       live = true;

@@ -765,7 +765,17 @@ function matchesType(filePath: string, type: DataFile["type"]): boolean {
 function getFingerprint(files: DataFile[]): string {
   return files.map((file) => {
     const stat = fs.statSync(file.path);
-    return `${file.alias ?? ""}:${file.type}:${file.path}:${stat.size}:${stat.mtimeMs}`;
+    return [
+      file.alias ?? "",
+      file.type,
+      file.path,
+      stat.dev,
+      stat.ino,
+      stat.size,
+      stat.mtimeMs,
+      stat.ctimeMs,
+      stat.birthtimeMs
+    ].join(":");
   }).join("|");
 }
 

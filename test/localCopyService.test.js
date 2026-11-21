@@ -131,6 +131,31 @@ test("creates a consistent local DuckDB snapshot and removes session copies afte
   }
 });
 
+test("shares a concurrently created copy across callers", async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "f4data-local-copy-race-"));
+  const leases = [];
+  try {
+    const { dashboardPath, dataPath } = createDashboard(root);
+    fs.writeFileSync(path.join(dataPath, "records.csv"), "id,label\n1,one\n");
+    const copies = new LocalCopyService(path.join(root, "cache"));
+    const options = { mode: "always", thresholdMb: 0, keep: "session" };
+    const [first, second] = await Promise.all([
+      copies.prepare(dashboardPath, options, { report() {} }, createToken()),
+      copies.prepare(dashboardPath, options, { report() {} }, createToken())
+    ]);
+    assert.ok(first);
+    assert.ok(second);
+    leases.push(first, second);
+    assert.equal(first.dataPath, second.dataPath);
+    assert.ok(fs.existsSync(path.join(first.dataPath, "records.csv")));
+  } finally {
+    for (const lease of leases) {
+      await lease.dispose();
+    }
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("cancellation returns to source without leaving a partial copy", async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "f4data-local-copy-cancel-"));
   try {

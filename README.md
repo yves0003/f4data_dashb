@@ -93,3 +93,5 @@ Initial column names are obtained with `DESCRIBE`; an optional sample is then fe
 Query results and initial previews share an 8 MiB byte-bounded LRU cache. Oversized individual results are returned but not cached, and concurrent identical operations share the same in-flight DuckDB work.
 
 Dashboard queries are streamed up to `f4datadashb.maxRows` (default `10000`, maximum `100000`); responses indicate whether they were truncated. A dashboard can send `cancelQuery` with the matching `requestId` to interrupt a running query. The optional `f4datadashb.pauseWhenHidden` setting (default `false`) cancels active queries and defers watcher-driven refreshes while its Webview is hidden, then refreshes when it becomes visible.
+
+Source fingerprints include file identity and change times as well as size and modification time, so atomically replacing a data file invalidates stale query and session caches even when its size and modification time are preserved. Concurrent VS Code windows can share a completed local copy; a competing copy operation verifies and leases the winner rather than failing on publication.

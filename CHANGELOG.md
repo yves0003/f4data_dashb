@@ -34,3 +34,10 @@
 - Added opt-in `f4datadashb.pauseWhenHidden` to cancel active queries and defer watcher refreshes while a dashboard is hidden.
 - Generated React and native HTML dashboards now cancel superseded queries, ignore stale responses, and indicate truncated results.
 - Tests verify bounded query results and active query interruption.
+
+### File replacement and concurrent local copies
+
+- Source fingerprints now include device/inode identity, change time, and birth time, invalidating stale query/session results after atomic file replacement even when size and modification time match.
+- Concurrent snapshot publishers verify and reuse a valid winner instead of failing when another VS Code process publishes the same source version first.
+- Lock records include the host name so PID checks are scoped to the current machine; older lock records remain readable.
+- Tests cover atomic data-file replacement and simultaneous local-copy preparation.
