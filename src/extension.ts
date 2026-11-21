@@ -449,6 +449,9 @@ import "./style.css";
 
 const vscode = typeof acquireVsCodeApi === "function" ? acquireVsCodeApi() : undefined;
 const dashboardTitle = ${titleValue};
+let requestSequence = 0;
+let activeRequestId;
+const nextRequestId = () => \`\${Date.now()}-\${++requestSequence}\`;
 const browserData = {
   files: ["Browser preview"],
   datasets: [{
@@ -477,8 +480,12 @@ function App() {
       } else if (message.command === "dashboardError") {
         setState({ status: "error", data: null, error: message.error });
       } else if (message.command === "queryResult") {
-        setResult(message);
-      } else if (message.command === "queryError") {
+        if (message.requestId === activeRequestId) {
+          activeRequestId = undefined;
+          setResult(message);
+        }
+      } else if (message.command === "queryError" && message.requestId === activeRequestId) {
+        activeRequestId = undefined;
         setState((current) => ({ ...current, error: message.error }));
       }
     };
@@ -488,11 +495,20 @@ function App() {
     } else {
       setState({ status: "ready", data: browserData, error: "" });
     }
-    return () => window.removeEventListener("message", onMessage);
+    return () => {
+      window.removeEventListener("message", onMessage);
+      if (vscode && activeRequestId) {
+        vscode.postMessage({ command: "cancelQuery", requestId: activeRequestId });
+      }
+    };
   }, []);
 
   const refresh = () => {
     if (vscode) {
+      if (activeRequestId) {
+        vscode.postMessage({ command: "cancelQuery", requestId: activeRequestId });
+        activeRequestId = undefined;
+      }
       vscode.postMessage({ command: "refresh" });
     } else {
       setResult(null);
@@ -502,9 +518,13 @@ function App() {
 
   const query = () => {
     if (vscode) {
+      if (activeRequestId) {
+        vscode.postMessage({ command: "cancelQuery", requestId: activeRequestId });
+      }
+      activeRequestId = nextRequestId();
       vscode.postMessage({
         command: "runQuery",
-        requestId: String(Date.now()),
+        requestId: activeRequestId,
         sql,
         force: true
       });
@@ -528,6 +548,7 @@ function App() {
     <textarea id="sql" value={sql} onChange={(event) => setSql(event.target.value)} />
     <button onClick={query}>{french ? "Exécuter" : "Run"}</button>
     {state.error && <p role="alert">{state.error}</p>}
+    {result?.truncated && <p role="status">{french ? \`Résultats limités aux \${result.maxRows} premières lignes.\` : \`Results limited to the first \${result.maxRows} rows.\`}</p>}
     {(result ? [result] : state.data.datasets).map((dataset, index) => <section key={dataset.name ?? index}>
       <h2>{dataset.name ?? (french ? "Résultat de la requête" : "Query result")}</h2>
       {dataset.error ? <p role="alert">{dataset.error}</p> : <pre>{JSON.stringify(dataset.rows, null, 2)}</pre>}
@@ -556,6 +577,9 @@ const app = document.getElementById("app");
 let state = { status: "loading", data: null, error: "" };
 let result = null;
 let sql = "SHOW TABLES";
+let requestSequence = 0;
+let activeRequestId;
+const nextRequestId = () => \`\${Date.now()}-\${++requestSequence}\`;
 
 function render() {
   app.replaceChildren();
@@ -621,6 +645,14 @@ function render() {
     const title = document.createElement("h2");
     title.textContent = dataset.name ?? (french ? "Résultat de la requête" : "Query result");
     section.append(title);
+    if (result?.truncated) {
+      const notice = document.createElement("p");
+      notice.setAttribute("role", "status");
+      notice.textContent = french
+        ? \`Résultats limités aux \${result.maxRows} premières lignes.\`
+        : \`Results limited to the first \${result.maxRows} rows.\`;
+      section.append(notice);
+    }
     if (dataset.error) {
       const error = document.createElement("p");
       error.setAttribute("role", "alert");
@@ -646,6 +678,10 @@ function createButton(label, action) {
 
 function refresh() {
   if (vscode) {
+    if (activeRequestId) {
+      vscode.postMessage({ command: "cancelQuery", requestId: activeRequestId });
+      activeRequestId = undefined;
+    }
     state = { ...state, status: "loading", error: "" };
     render();
     vscode.postMessage({ command: "refresh" });
@@ -659,7 +695,11 @@ function refresh() {
 function runQuery() {
   state = { ...state, error: "" };
   if (vscode) {
-    vscode.postMessage({ command: "runQuery", requestId: String(Date.now()), sql, force: true });
+    if (activeRequestId) {
+      vscode.postMessage({ command: "cancelQuery", requestId: activeRequestId });
+    }
+    activeRequestId = nextRequestId();
+    vscode.postMessage({ command: "runQuery", requestId: activeRequestId, sql, force: true });
   } else {
     result = {
       name: "Browser preview (sample data)",
@@ -681,19 +721,30 @@ window.addEventListener("message", (event) => {
     state = { status: "error", data: null, error: message.error };
     render();
   } else if (message.command === "queryResult") {
+    if (message.requestId !== activeRequestId) return;
+    activeRequestId = undefined;
     result = {
       name: french ? "Résultat de la requête" : "Query result",
       columns: message.columns,
-      rows: message.rows
+      rows: message.rows,
+      truncated: message.truncated,
+      maxRows: message.maxRows
     };
     render();
   } else if (message.command === "queryError") {
+    if (message.requestId !== activeRequestId) return;
+    activeRequestId = undefined;
     state = { ...state, error: message.error };
     render();
   }
 });
 
 render();
+window.addEventListener("beforeunload", () => {
+  if (vscode && activeRequestId) {
+    vscode.postMessage({ command: "cancelQuery", requestId: activeRequestId });
+  }
+});
 if (vscode) {
   vscode.postMessage({ command: "ready" });
 } else {
@@ -743,7 +794,7 @@ La présence de \`acquireVsCodeApi()\` indique l’exécution dans une Webview V
 
 Dans la Webview, écoutez les messages \`window.addEventListener("message", ...)\` et envoyez les commandes avec \`vscode.postMessage(...)\`. Envoyez \`{ command: "ready" }\` après l’installation du gestionnaire d’événements. L’extension répond avec \`{ command: "initData", data }\`. La commande \`refresh\` recharge les données et \`runQuery\` exécute une requête DuckDB ; les réponses sont \`queryResult\` ou \`queryError\`.
 
-La communication est bidirectionnelle : l’extension envoie les données et résultats à la Webview, et l’interface demande des actualisations ou des requêtes à l’extension. Vérifiez les messages reçus et n’envoyez pas de données non sérialisables.
+La communication est bidirectionnelle : l’extension envoie les données et résultats à la Webview, et l’interface demande des actualisations ou des requêtes à l’extension. Envoyez \`{ command: "runQuery", requestId, sql }\` pour exécuter une requête, puis \`{ command: "cancelQuery", requestId }\` pour l’annuler. Les résultats incluent \`columns\`, \`rows\`, \`truncated\` et \`maxRows\`; les requêtes sont limitées par le paramètre \`f4datadashb.maxRows\`. Vérifiez les messages reçus et n’envoyez pas de données non sérialisables.
 
 ## États d’interface obligatoires
 

@@ -91,3 +91,5 @@ Reusing an instance retains DuckDB's native memory and may keep database files o
 Initial column names are obtained with `DESCRIBE`; an optional sample is then fetched up to `previewRows`. If one data file cannot be opened, its dataset reports an error while other valid sources remain available. Data watcher events are debounced for one second, and WAL/temporary-file events are ignored.
 
 Query results and initial previews share an 8 MiB byte-bounded LRU cache. Oversized individual results are returned but not cached, and concurrent identical operations share the same in-flight DuckDB work.
+
+Dashboard queries are streamed up to `f4datadashb.maxRows` (default `10000`, maximum `100000`); responses indicate whether they were truncated. A dashboard can send `cancelQuery` with the matching `requestId` to interrupt a running query. The optional `f4datadashb.pauseWhenHidden` setting (default `false`) cancels active queries and defers watcher-driven refreshes while its Webview is hidden, then refreshes when it becomes visible.

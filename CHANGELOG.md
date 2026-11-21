@@ -27,3 +27,10 @@
 - Query results and initial previews now share an 8 MiB byte-bounded LRU cache; oversized individual results are returned without being retained.
 - Concurrent identical operations are deduplicated, and invalidation prevents in-flight stale results from repopulating the cache.
 - Automated tests verify concurrent query deduplication, cache reuse, and LRU eviction after the aggregate result size exceeds the budget.
+
+### Query and Webview lifecycle limits
+
+- Added typed validation for incoming and outgoing dashboard messages, legacy request IDs, query cancellation via DuckDB connection interruption, and `f4datadashb.maxRows` (default 10,000; maximum 100,000).
+- Added opt-in `f4datadashb.pauseWhenHidden` to cancel active queries and defer watcher refreshes while a dashboard is hidden.
+- Generated React and native HTML dashboards now cancel superseded queries, ignore stale responses, and indicate truncated results.
+- Tests verify bounded query results and active query interruption.

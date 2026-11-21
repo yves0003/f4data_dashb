@@ -33,6 +33,11 @@ export interface DuckDbRuntimeOptions {
   maxConcurrency: number;
 }
 
+export interface QueryOptions {
+  maxRows?: number;
+  signal?: AbortSignal;
+}
+
 interface DataSourceConfig {
   name: string;
   path: string;
@@ -55,6 +60,8 @@ type QueryCacheEntry = {
   fingerprint: string;
   rows: Record<string, unknown>[];
   columns: string[];
+  truncated: boolean;
+  maxRows: number;
 };
 
 type CachedResult = InitialData | QueryCacheEntry;
@@ -184,27 +191,42 @@ export class DuckDbService {
     sql: string,
     force = false,
     dataRootOverride?: string,
-    sessionOptions?: DuckDbRuntimeOptions
+    sessionOptions?: DuckDbRuntimeOptions,
+    queryOptions: QueryOptions = {}
   ): Promise<QueryCacheEntry> {
+    if (
+      queryOptions.maxRows !== undefined &&
+      (!Number.isSafeInteger(queryOptions.maxRows) || queryOptions.maxRows < 1 || queryOptions.maxRows > 100_000)
+    ) {
+      throw new Error("DuckDB query maxRows must be an integer between 1 and 100000");
+    }
     const files = resolveDataFiles(dashboardPath, dataRootOverride);
     const fingerprint = getFingerprint(files);
-    const key = `${dashboardCacheKey(dashboardPath, dataRootOverride)}\0query:${sql.trim()}`;
+    const key = `${dashboardCacheKey(dashboardPath, dataRootOverride)}\0query:${queryOptions.maxRows ?? "all"}:${sql.trim()}`;
     const cached = !force ? this.getCached<QueryCacheEntry>(key, fingerprint) : undefined;
     if (cached) {
       return cached;
     }
 
     const generation = this.cacheGeneration(dashboardPath);
-    return this.deduplicate(key, fingerprint, async () => {
+    const executeQuery = async (): Promise<QueryCacheEntry> => {
       const result = await this.withDatabase(files, async (connection) => {
-        return readQuery(connection, sql);
+        return readQuery(connection, sql, queryOptions.maxRows, queryOptions.signal);
       }, dashboardPath, dataRootOverride, sessionOptions);
-      const entry = { fingerprint, ...result };
-      if (this.cacheGeneration(dashboardPath) === generation) {
+      const entry = {
+        fingerprint,
+        ...result,
+        truncated: result.truncated === true,
+        maxRows: queryOptions.maxRows ?? result.rows.length
+      };
+      if (!queryOptions.signal?.aborted && this.cacheGeneration(dashboardPath) === generation) {
         this.setCached(key, fingerprint, entry);
       }
       return entry;
-    });
+    };
+    return queryOptions.signal
+      ? executeQuery()
+      : this.deduplicate(key, fingerprint, executeQuery);
   }
 
   async invalidate(dashboardPath: string, dataRootOverride?: string): Promise<void> {
@@ -823,16 +845,53 @@ function rowsAsObjects(rows: object[]): Record<string, unknown>[] {
 
 async function readQuery(
   connection: Awaited<ReturnType<DuckDBInstance["connect"]>>,
-  sql: string
-): Promise<{ columns: string[]; rows: Record<string, unknown>[] }> {
-  const reader = await connection.runAndReadAll(sql);
+  sql: string,
+  maxRows?: number,
+  signal?: AbortSignal
+): Promise<{
+  columns: string[];
+  rows: Record<string, unknown>[];
+  truncated?: boolean;
+  maxRows?: number;
+}> {
+  if (signal?.aborted) {
+    throw new QueryCancelledError();
+  }
+  let reader: Awaited<ReturnType<typeof connection.runAndReadAll>> | undefined;
+  const interrupt = (): void => connection.interrupt();
+  signal?.addEventListener("abort", interrupt, { once: true });
   try {
+    if (signal?.aborted) {
+      throw new QueryCancelledError();
+    }
+    reader = maxRows === undefined
+      ? await connection.runAndReadAll(sql)
+      : await connection.runAndReadUntil(sql, maxRows + 1);
+    if (signal?.aborted) {
+      throw new QueryCancelledError();
+    }
+    const rawRows = reader.getRowObjects();
+    const truncated = maxRows !== undefined && (!reader.done || rawRows.length > maxRows);
     return {
       columns: reader.columnNames(),
-      rows: rowsAsObjects(reader.getRowObjects())
+      rows: rowsAsObjects(maxRows === undefined ? rawRows : rawRows.slice(0, maxRows)),
+      ...(maxRows === undefined ? {} : { truncated, maxRows })
     };
+  } catch (error) {
+    if (signal?.aborted) {
+      throw new QueryCancelledError();
+    }
+    throw error;
   } finally {
-    reader.closeSync();
+    signal?.removeEventListener("abort", interrupt);
+    reader?.closeSync();
+  }
+}
+
+class QueryCancelledError extends Error {
+  constructor() {
+    super("Query cancelled");
+    this.name = "QueryCancelledError";
   }
 }
 

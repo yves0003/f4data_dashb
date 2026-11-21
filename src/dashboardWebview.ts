@@ -2,7 +2,12 @@ import { randomBytes } from "node:crypto";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import * as vscode from "vscode";
-import { DuckDbRuntimeOptions, DuckDbService, isRelevantDataChange } from "./duckdbService";
+import {
+  DuckDbRuntimeOptions,
+  DuckDbService,
+  InitialData,
+  isRelevantDataChange
+} from "./duckdbService";
 import { MessageKey, translate } from "./i18n";
 import {
   InsufficientCopySpaceError,
@@ -28,6 +33,8 @@ export class DashboardWebviewManager {
     }
     const databaseOptions = readDuckDbRuntimeOptions();
     const previewRows = readPreviewRows();
+    const maxRows = readMaxRows();
+    const pauseWhenHidden = readPauseWhenHidden();
     let activeCopy = await this.prepareLocalCopy(resolvedPath);
     let activeDataPath = activeCopy?.dataPath;
     let databaseLease = databaseOptions.reuseInstance
@@ -52,6 +59,9 @@ export class DashboardWebviewManager {
     }
     let ready = false;
     let disposed = false;
+    const activeQueries = new Map<string, AbortController>();
+    let refreshAfterReveal = false;
+    let copyUpdateAfterReveal = false;
 
     const vueWatcher = vscode.workspace.createFileSystemWatcher(
       new vscode.RelativePattern(vscode.Uri.file(vuePath), "**/*")
@@ -84,7 +94,7 @@ export class DashboardWebviewManager {
           databaseOptions,
           previewRows
         );
-        await panel.webview.postMessage({ command: "initData", data });
+        await postHostMessage(panel.webview, { command: "initData", data });
       } catch (error) {
         await this.sendError(panel.webview, error);
       }
@@ -92,6 +102,7 @@ export class DashboardWebviewManager {
 
     const invalidateData = async (): Promise<void> => {
       try {
+        cancelActiveQueries();
         await this.duckDb.invalidate(resolvedPath, activeDataPath);
         if (ready) {
           await sendInitialData(true);
@@ -101,12 +112,19 @@ export class DashboardWebviewManager {
       }
     };
 
+    const cancelActiveQueries = (): void => {
+      for (const controller of activeQueries.values()) {
+        controller.abort();
+      }
+    };
+
     const refreshLocalCopy = async (): Promise<void> => {
       const nextCopy = await this.prepareLocalCopy(resolvedPath, true);
       if (!nextCopy || disposed) {
         await nextCopy?.dispose();
         return;
       }
+      cancelActiveQueries();
       await this.duckDb.invalidate(resolvedPath);
       await databaseLease?.dispose();
       const previousCopy = activeCopy;
@@ -149,6 +167,10 @@ export class DashboardWebviewManager {
       if (!isRelevantDataChange(uri.fsPath)) {
         return;
       }
+      if (pauseWhenHidden && !panel.visible) {
+        copyUpdateAfterReveal = true;
+        return;
+      }
       if (sourceChangeTimer) {
         clearTimeout(sourceChangeTimer);
       }
@@ -170,12 +192,36 @@ export class DashboardWebviewManager {
         clearTimeout(dataChangeTimer);
       }
       dataChangeTimer = setTimeout(() => {
+        if (pauseWhenHidden && !panel.visible) {
+          refreshAfterReveal = true;
+          cancelActiveQueries();
+          return;
+        }
         void invalidateData();
       }, 1000);
     };
 
+    const visibilityWatcher = panel.onDidChangeViewState(({ webviewPanel }) => {
+      if (!pauseWhenHidden) {
+        return;
+      }
+      if (!webviewPanel.visible) {
+        cancelActiveQueries();
+        return;
+      }
+      if (refreshAfterReveal) {
+        refreshAfterReveal = false;
+        void invalidateData();
+      }
+      if (copyUpdateAfterReveal) {
+        copyUpdateAfterReveal = false;
+        void promptForCopyUpdate();
+      }
+    });
+
     const subscriptions: vscode.Disposable[] = [
       vueWatcher,
+      visibilityWatcher,
       ...dataWatchers,
       ...(sourceWatcher ? [sourceWatcher] : []),
       vueWatcher.onDidChange(updateHtml),
@@ -192,40 +238,78 @@ export class DashboardWebviewManager {
         watcher.onDidDelete(scheduleDataRefresh)
       ]),
       panel.webview.onDidReceiveMessage(async (message: unknown) => {
-        if (!isWebviewMessage(message)) {
+        const request = parseWebviewMessage(message);
+        if (!request) {
+          console.warn("Ignoring malformed F4Data dashboard Webview message");
           return;
         }
-        if (message.command === "ready") {
+        if (request.command === "ready") {
           ready = true;
           await sendInitialData(false);
           return;
         }
-        if (message.command === "refresh") {
+        if (request.command === "refresh") {
+          cancelActiveQueries();
           await this.duckDb.invalidate(resolvedPath, activeDataPath);
           await sendInitialData(true);
           return;
         }
-        if (message.command === "runQuery" && typeof message.sql === "string") {
+        if (request.command === "cancelQuery") {
+          activeQueries.get(request.requestId)?.abort();
+          return;
+        }
+        if (request.command === "runQuery") {
+          if (pauseWhenHidden && !panel.visible) {
+            await postHostMessage(panel.webview, {
+              command: "queryError",
+              requestId: request.requestId,
+              error: "Dashboard is hidden; query was not started."
+            });
+            return;
+          }
+          if (activeQueries.has(request.requestId)) {
+            await postHostMessage(panel.webview, {
+              command: "queryError",
+              requestId: request.requestId,
+              error: "A query with this requestId is already running."
+            });
+            return;
+          }
+          const controller = new AbortController();
+          activeQueries.set(request.requestId, controller);
           try {
             const result = await this.duckDb.query(
               resolvedPath,
-              message.sql,
-              message.force === true,
+              request.sql,
+              request.force === true,
               activeDataPath,
-              databaseOptions
+              databaseOptions,
+              { maxRows, signal: controller.signal }
             );
-            await panel.webview.postMessage({
+            if (disposed || controller.signal.aborted) {
+              return;
+            }
+            await postHostMessage(panel.webview, {
               command: "queryResult",
-              requestId: message.requestId,
+              requestId: request.requestId,
               columns: result.columns,
-              rows: result.rows
+              rows: result.rows,
+              truncated: result.truncated,
+              maxRows: result.maxRows
             });
           } catch (error) {
-            await panel.webview.postMessage({
+            if (controller.signal.aborted || disposed) {
+              return;
+            }
+            await postHostMessage(panel.webview, {
               command: "queryError",
-              requestId: message.requestId,
+              requestId: request.requestId,
               error: translate(this.language, "queryFailed", errorMessage(error))
             });
+          } finally {
+            if (activeQueries.get(request.requestId) === controller) {
+              activeQueries.delete(request.requestId);
+            }
           }
         }
       }),
@@ -234,6 +318,7 @@ export class DashboardWebviewManager {
         if (sourceChangeTimer) {
           clearTimeout(sourceChangeTimer);
         }
+        cancelActiveQueries();
         if (dataChangeTimer) {
           clearTimeout(dataChangeTimer);
         }
@@ -341,21 +426,76 @@ export class DashboardWebviewManager {
   }
 
   private async sendError(webview: vscode.Webview, error: unknown): Promise<void> {
-    await webview.postMessage({
+    await postHostMessage(webview, {
       command: "dashboardError",
       error: translate(this.language, "dashboardOperationFailed", errorMessage(error))
     });
   }
 }
 
-function isWebviewMessage(value: unknown): value is {
-  command: string;
-  sql?: string;
-  requestId?: string;
-  force?: boolean;
-} {
-  return typeof value === "object" && value !== null && "command" in value
-    && typeof value.command === "string";
+type DashboardWebviewRequest =
+  | { command: "ready" }
+  | { command: "refresh" }
+  | { command: "cancelQuery"; requestId: string }
+  | { command: "runQuery"; requestId: string; sql: string; force?: boolean };
+
+type DashboardWebviewResponse =
+  | { command: "initData"; data: InitialData }
+  | {
+    command: "queryResult";
+    requestId: string;
+    columns: string[];
+    rows: Record<string, unknown>[];
+    truncated: boolean;
+    maxRows: number;
+  }
+  | { command: "queryError"; requestId: string; error: string }
+  | { command: "dashboardError"; error: string };
+
+function postHostMessage(
+  webview: vscode.Webview,
+  message: DashboardWebviewResponse
+): Thenable<boolean> {
+  return webview.postMessage(message);
+}
+
+function parseWebviewMessage(value: unknown): DashboardWebviewRequest | undefined {
+  if (typeof value !== "object" || value === null || !("command" in value)) {
+    return undefined;
+  }
+  const message = value as Record<string, unknown>;
+  if (message.command === "ready" || message.command === "refresh") {
+    return { command: message.command };
+  }
+  if (message.command === "cancelQuery") {
+    return typeof message.requestId === "string" &&
+      message.requestId.length > 0 &&
+      message.requestId.length <= 128
+      ? { command: "cancelQuery", requestId: message.requestId }
+      : undefined;
+  }
+  if (
+    message.command === "runQuery" &&
+    typeof message.sql === "string" &&
+    message.sql.length <= 1_000_000 &&
+    (message.force === undefined || typeof message.force === "boolean") &&
+    (
+      message.requestId === undefined ||
+      typeof message.requestId === "string" &&
+        message.requestId.length > 0 &&
+        message.requestId.length <= 128
+    )
+  ) {
+    return {
+      command: "runQuery",
+      requestId: typeof message.requestId === "string"
+        ? message.requestId
+        : `legacy-${randomBytes(12).toString("hex")}`,
+      sql: message.sql,
+      force: message.force
+    };
+  }
+  return undefined;
 }
 
 function getNonce(): string {
@@ -392,6 +532,22 @@ function readPreviewRows(): number {
   const value = vscode.workspace.getConfiguration("f4datadashb").get<unknown>("previewRows", 100);
   if (typeof value !== "number" || !Number.isInteger(value) || value < 0) {
     throw new Error("f4datadashb.previewRows must be a non-negative integer");
+  }
+  return value;
+}
+
+function readMaxRows(): number {
+  const value = vscode.workspace.getConfiguration("f4datadashb").get<unknown>("maxRows", 10_000);
+  if (typeof value !== "number" || !Number.isSafeInteger(value) || value < 1 || value > 100_000) {
+    throw new Error("f4datadashb.maxRows must be an integer between 1 and 100000");
+  }
+  return value;
+}
+
+function readPauseWhenHidden(): boolean {
+  const value = vscode.workspace.getConfiguration("f4datadashb").get<unknown>("pauseWhenHidden", false);
+  if (typeof value !== "boolean") {
+    throw new Error("f4datadashb.pauseWhenHidden must be a boolean");
   }
   return value;
 }

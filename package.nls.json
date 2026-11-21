@@ -21,5 +21,7 @@
   "setting.reuseDuckDbInstance.description": "Reuse one DuckDB instance while a dashboard is open. Can keep source database files locked until released or idle timeout.",
   "setting.duckdbIdleReleaseSeconds.description": "Close an idle reused DuckDB instance after this many seconds. Set to 0 to disable the idle timeout.",
   "setting.duckdbMaxConcurrency.description": "Maximum simultaneous DuckDB connections for a reused dashboard instance.",
-  "setting.previewRows.description": "Maximum number of rows sampled for each initial dataset preview. Set to 0 to return schema only."
+  "setting.previewRows.description": "Maximum number of rows sampled for each initial dataset preview. Set to 0 to return schema only.",
+  "setting.maxRows.description": "Maximum number of rows returned by a dashboard query (default 10000; maximum 100000).",
+  "setting.pauseWhenHidden.description": "Cancel active queries and defer automatic data refreshes while the dashboard Webview is hidden."
 }

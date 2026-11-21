@@ -21,5 +21,7 @@
   "setting.reuseDuckDbInstance.description": "Réutiliser une instance DuckDB tant que le dashboard est ouvert. Les fichiers source peuvent rester verrouillés jusqu’à la libération ou l’expiration du délai.",
   "setting.duckdbIdleReleaseSeconds.description": "Fermer une instance DuckDB réutilisée après ce délai d’inactivité, en secondes. La valeur 0 désactive le délai.",
   "setting.duckdbMaxConcurrency.description": "Nombre maximal de connexions DuckDB simultanées pour une instance réutilisée.",
-  "setting.previewRows.description": "Nombre maximal de lignes échantillonnées pour chaque aperçu initial. La valeur 0 ne renvoie que le schéma."
+  "setting.previewRows.description": "Nombre maximal de lignes échantillonnées pour chaque aperçu initial. La valeur 0 ne renvoie que le schéma.",
+  "setting.maxRows.description": "Nombre maximal de lignes renvoyées par une requête du tableau de bord (10 000 par défaut ; maximum 100 000).",
+  "setting.pauseWhenHidden.description": "Annuler les requêtes actives et différer les actualisations automatiques lorsque la Webview est masquée."
 }
