@@ -15,3 +15,9 @@
 - Automated tests verify that eight concurrent queries can use the attached database, and that invalidation/release permits reopening a changed database. The option remains disabled by default.
 - Local benchmark only: for five forced `COUNT(*)` queries against a 1,000,000-row, 18.4 MB DuckDB file, median latency was 16.1 ms with a fresh instance per operation and 1.5 ms with a reused instance; the first reused query took 13.8 ms including initialization. Process RSS rose by 0.8 MiB during this small test, an approximate and workload-specific measurement.
 - No after-change UNC benchmark was available. The local result demonstrates a non-negligible reduction in per-operation setup, but does not quantify performance on the user's network share.
+
+### Initial previews and watcher updates
+
+- Added `f4datadashb.previewRows` (default `100` for compatibility; `0` requests only schema), obtain column names through `DESCRIBE`, and isolate an invalid source file to its own dataset error.
+- Data-source watcher notifications are debounced by one second and WAL/temporary files are ignored.
+- Automated tests check schema-only mode, the default 100-row sample, an invalid DuckDB file alongside a valid CSV, and watcher filtering.

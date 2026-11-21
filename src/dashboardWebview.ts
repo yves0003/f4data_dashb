@@ -2,7 +2,7 @@ import { randomBytes } from "node:crypto";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import * as vscode from "vscode";
-import { DuckDbRuntimeOptions, DuckDbService } from "./duckdbService";
+import { DuckDbRuntimeOptions, DuckDbService, isRelevantDataChange } from "./duckdbService";
 import { MessageKey, translate } from "./i18n";
 import {
   InsufficientCopySpaceError,
@@ -27,6 +27,7 @@ export class DashboardWebviewManager {
       throw new Error(translate(this.language, "dashboardNotReady"));
     }
     const databaseOptions = readDuckDbRuntimeOptions();
+    const previewRows = readPreviewRows();
     let activeCopy = await this.prepareLocalCopy(resolvedPath);
     let activeDataPath = activeCopy?.dataPath;
     let databaseLease = databaseOptions.reuseInstance
@@ -80,7 +81,8 @@ export class DashboardWebviewManager {
           resolvedPath,
           force,
           activeDataPath,
-          databaseOptions
+          databaseOptions,
+          previewRows
         );
         await panel.webview.postMessage({ command: "initData", data });
       } catch (error) {
@@ -143,7 +145,10 @@ export class DashboardWebviewManager {
         updatePromptOpen = false;
       }
     };
-    const scheduleCopyUpdatePrompt = (): void => {
+    const scheduleCopyUpdatePrompt = (uri: vscode.Uri): void => {
+      if (!isRelevantDataChange(uri.fsPath)) {
+        return;
+      }
       if (sourceChangeTimer) {
         clearTimeout(sourceChangeTimer);
       }
@@ -156,6 +161,19 @@ export class DashboardWebviewManager {
       }, 1000);
     };
 
+    let dataChangeTimer: NodeJS.Timeout | undefined;
+    const scheduleDataRefresh = (uri: vscode.Uri): void => {
+      if (!isRelevantDataChange(uri.fsPath)) {
+        return;
+      }
+      if (dataChangeTimer) {
+        clearTimeout(dataChangeTimer);
+      }
+      dataChangeTimer = setTimeout(() => {
+        void invalidateData();
+      }, 1000);
+    };
+
     const subscriptions: vscode.Disposable[] = [
       vueWatcher,
       ...dataWatchers,
@@ -164,14 +182,14 @@ export class DashboardWebviewManager {
       vueWatcher.onDidCreate(updateHtml),
       vueWatcher.onDidDelete(updateHtml),
       ...(sourceWatcher ? [
-        sourceWatcher.onDidChange(scheduleCopyUpdatePrompt),
-        sourceWatcher.onDidCreate(scheduleCopyUpdatePrompt),
-        sourceWatcher.onDidDelete(scheduleCopyUpdatePrompt)
+        sourceWatcher.onDidChange((uri) => scheduleCopyUpdatePrompt(uri)),
+        sourceWatcher.onDidCreate((uri) => scheduleCopyUpdatePrompt(uri)),
+        sourceWatcher.onDidDelete((uri) => scheduleCopyUpdatePrompt(uri))
       ] : []),
       ...dataWatchers.flatMap((watcher) => [
-        watcher.onDidChange(() => { void invalidateData(); }),
-        watcher.onDidCreate(() => { void invalidateData(); }),
-        watcher.onDidDelete(() => { void invalidateData(); })
+        watcher.onDidChange(scheduleDataRefresh),
+        watcher.onDidCreate(scheduleDataRefresh),
+        watcher.onDidDelete(scheduleDataRefresh)
       ]),
       panel.webview.onDidReceiveMessage(async (message: unknown) => {
         if (!isWebviewMessage(message)) {
@@ -215,6 +233,9 @@ export class DashboardWebviewManager {
         disposed = true;
         if (sourceChangeTimer) {
           clearTimeout(sourceChangeTimer);
+        }
+        if (dataChangeTimer) {
+          clearTimeout(dataChangeTimer);
         }
         void (async () => {
           await databaseLease?.dispose();
@@ -357,6 +378,7 @@ function readDuckDbRuntimeOptions(): DuckDbRuntimeOptions {
   if (typeof reuseInstance !== "boolean") {
     throw new Error("f4datadashb.reuseDuckDbInstance must be a boolean");
   }
+
   if (typeof idleReleaseSeconds !== "number" || !Number.isInteger(idleReleaseSeconds) || idleReleaseSeconds < 0) {
     throw new Error("f4datadashb.duckdbIdleReleaseSeconds must be a non-negative integer");
   }
@@ -364,4 +386,12 @@ function readDuckDbRuntimeOptions(): DuckDbRuntimeOptions {
     throw new Error("f4datadashb.duckdbMaxConcurrency must be a positive integer");
   }
   return { reuseInstance, idleReleaseSeconds, maxConcurrency };
+}
+
+function readPreviewRows(): number {
+  const value = vscode.workspace.getConfiguration("f4datadashb").get<unknown>("previewRows", 100);
+  if (typeof value !== "number" || !Number.isInteger(value) || value < 0) {
+    throw new Error("f4datadashb.previewRows must be a non-negative integer");
+  }
+  return value;
 }

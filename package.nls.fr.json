@@ -20,5 +20,6 @@
   "setting.localCopyKeep.description": "Conserver les copies pendant la session VS Code ou pendant N jours après la dernière utilisation (ex. days:7).",
   "setting.reuseDuckDbInstance.description": "Réutiliser une instance DuckDB tant que le dashboard est ouvert. Les fichiers source peuvent rester verrouillés jusqu’à la libération ou l’expiration du délai.",
   "setting.duckdbIdleReleaseSeconds.description": "Fermer une instance DuckDB réutilisée après ce délai d’inactivité, en secondes. La valeur 0 désactive le délai.",
-  "setting.duckdbMaxConcurrency.description": "Nombre maximal de connexions DuckDB simultanées pour une instance réutilisée."
+  "setting.duckdbMaxConcurrency.description": "Nombre maximal de connexions DuckDB simultanées pour une instance réutilisée.",
+  "setting.previewRows.description": "Nombre maximal de lignes échantillonnées pour chaque aperçu initial. La valeur 0 ne renvoie que le schéma."
 }

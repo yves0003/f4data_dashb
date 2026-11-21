@@ -127,6 +127,12 @@
           "maximum": 16,
           "default": 4,
           "description": "%setting.duckdbMaxConcurrency.description%"
+        },
+        "f4datadashb.previewRows": {
+          "type": "integer",
+          "minimum": 0,
+          "default": 100,
+          "description": "%setting.previewRows.description%"
         }
       }
     },

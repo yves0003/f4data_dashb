@@ -14,6 +14,19 @@ export interface DataWatchPattern {
   pattern: string;
 }
 
+export function isRelevantDataChange(filePath: string): boolean {
+  const fileName = path.basename(filePath).toLowerCase();
+  if (
+    fileName.startsWith("~$") ||
+    /\.(?:wal|tmp|temp|partial|swp|lock)$/.test(fileName) ||
+    fileName.endsWith("~")
+  ) {
+    return false;
+  }
+  return [".csv", ".tsv", ".parquet", ".duckdb", ".ddb"]
+    .includes(path.extname(fileName));
+}
+
 export interface DuckDbRuntimeOptions {
   reuseInstance: boolean;
   idleReleaseSeconds: number;
@@ -49,6 +62,7 @@ type DuckDbConnection = Awaited<ReturnType<DuckDBInstance["connect"]>>;
 interface DatabaseSession {
   key: string;
   fingerprint: string;
+  fileErrors: Map<string, string>;
   instance: DuckDBInstance;
   connections: DuckDbConnection[];
   busyConnections: Set<DuckDbConnection>;
@@ -76,19 +90,25 @@ export class DuckDbService {
     dashboardPath: string,
     force = false,
     dataRootOverride?: string,
-    sessionOptions?: DuckDbRuntimeOptions
+    sessionOptions?: DuckDbRuntimeOptions,
+    previewRows = 100
   ): Promise<InitialData> {
     const files = resolveDataFiles(dashboardPath, dataRootOverride);
     const fingerprint = getFingerprint(files);
-    const cacheKey = dashboardCacheKey(dashboardPath, dataRootOverride);
+    const cacheKey = `${dashboardCacheKey(dashboardPath, dataRootOverride)}\0preview:${previewRows}`;
     const cached = !force ? this.initialCache.get(cacheKey) : undefined;
     if (cached?.fingerprint === fingerprint) {
       return JSON.parse(JSON.stringify(cached.data)) as InitialData;
     }
 
-    const datasets = await this.withDatabase(files, async (connection) => {
+    const datasets = await this.withDatabase(files, async (connection, fileErrors) => {
       const results: DatasetResult[] = [];
       for (const file of files) {
+        const setupError = fileErrors.get(file.path);
+        if (setupError) {
+          results.push({ name: file.name, columns: [], rows: [], error: setupError });
+          continue;
+        }
         try {
           if (file.type === "duckdb") {
             const tables = await readQuery(connection, "SHOW ALL TABLES");
@@ -98,23 +118,28 @@ export class DuckDbService {
               const tableName = typeof tableRow.name === "string" ? tableRow.name : "";
               if (tableName) {
                 const schema = typeof tableRow.schema === "string" ? tableRow.schema : "main";
-                const query = `SELECT * FROM ${quoteIdentifier(alias)}.${quoteIdentifier(schema)}.${quoteIdentifier(tableName)} LIMIT 100`;
-                const result = await readQuery(connection, query);
+                const tablePath = `${quoteIdentifier(alias)}.${quoteIdentifier(schema)}.${quoteIdentifier(tableName)}`;
+                const columns = await readSchema(connection, tablePath);
+                const rows = previewRows > 0
+                  ? (await readQuery(connection, `SELECT * FROM ${tablePath} LIMIT ${previewRows}`)).rows
+                  : [];
                 results.push({
                   name: `${file.alias ? `${file.alias}: ` : `${file.name}: `}${tableName}`,
-                  columns: result.columns,
-                  rows: result.rows
+                  columns,
+                  rows
                 });
               }
             }
           } else {
-            const result = await readQuery(connection,
-              `SELECT * FROM ${quoteIdentifier(viewName(file, files))} LIMIT 100`
-            );
+            const view = quoteIdentifier(viewName(file, files));
+            const columns = await readSchema(connection, view);
+            const rows = previewRows > 0
+              ? (await readQuery(connection, `SELECT * FROM ${view} LIMIT ${previewRows}`)).rows
+              : [];
             results.push({
               name: file.alias ?? file.name,
-              columns: result.columns,
-              rows: result.rows
+              columns,
+              rows
             });
           }
         } catch (error) {
@@ -250,7 +275,7 @@ export class DuckDbService {
 
   private async withDatabase<T>(
     files: DataFile[],
-    callback: (connection: DuckDbConnection) => Promise<T>,
+    callback: (connection: DuckDbConnection, fileErrors: Map<string, string>) => Promise<T>,
     dashboardPath: string,
     dataRootOverride?: string,
     sessionOptions?: DuckDbRuntimeOptions
@@ -267,8 +292,8 @@ export class DuckDbService {
     let connection: Awaited<ReturnType<DuckDBInstance["connect"]>> | undefined;
     try {
       connection = await instance.connect();
-      await attachFiles(connection, files);
-      return await callback(connection);
+      const fileErrors = await attachFiles(connection, files);
+      return await callback(connection, fileErrors);
     } finally {
       try {
         connection?.closeSync();
@@ -280,7 +305,7 @@ export class DuckDbService {
 
   private async withPersistentDatabase<T>(
     files: DataFile[],
-    callback: (connection: DuckDbConnection) => Promise<T>,
+    callback: (connection: DuckDbConnection, fileErrors: Map<string, string>) => Promise<T>,
     key: string,
     options: DuckDbRuntimeOptions
   ): Promise<T> {
@@ -288,7 +313,7 @@ export class DuckDbService {
     const session = await this.getOrCreateSession(key, fingerprint, files);
     const connection = await this.acquireConnection(session, options.maxConcurrency);
     try {
-      return await callback(connection);
+      return await callback(connection, session.fileErrors);
     } finally {
       this.releaseConnection(session, connection, options.idleReleaseSeconds);
     }
@@ -343,10 +368,11 @@ export class DuckDbService {
     let connection: DuckDbConnection | undefined;
     try {
       connection = await instance.connect();
-      await attachFiles(connection, files);
+      const fileErrors = await attachFiles(connection, files);
       const session: DatabaseSession = {
         key,
         fingerprint,
+        fileErrors,
         instance,
         connections: [connection],
         busyConnections: new Set(),
@@ -649,24 +675,42 @@ function databaseAlias(file: DataFile, files: DataFile[]): string {
   return `db_${files.indexOf(file)}_${path.basename(file.name, path.extname(file.name)).replace(/[^a-zA-Z0-9_]/g, "_")}`;
 }
 
-async function attachFiles(connection: DuckDbConnection, files: DataFile[]): Promise<void> {
+async function attachFiles(
+  connection: DuckDbConnection,
+  files: DataFile[]
+): Promise<Map<string, string>> {
+  const fileErrors = new Map<string, string>();
   for (const file of files.filter((candidate) => candidate.type === "duckdb")) {
-    const result = await connection.run(
-      `ATTACH ${quoteString(file.path)} AS ${quoteIdentifier(databaseAlias(file, files))} (READ_ONLY)`
-    );
-    result.closeSync();
+    try {
+      const result = await connection.run(
+        `ATTACH ${quoteString(file.path)} AS ${quoteIdentifier(databaseAlias(file, files))} (READ_ONLY)`
+      );
+      result.closeSync();
+    } catch (error) {
+      fileErrors.set(file.path, errorMessage(error));
+    }
   }
   for (const file of files) {
     if (file.type === "duckdb") {
       continue;
     }
-    const readerFunction = file.type === "parquet" ? "read_parquet" : "read_csv_auto";
-    const options = file.type === "tsv" ? ", delim='\\t'" : "";
-    const result = await connection.run(
-      `CREATE OR REPLACE VIEW ${quoteIdentifier(viewName(file, files))} AS SELECT * FROM ${readerFunction}(${quoteString(escapeGlob(file.path))}${options})`
-    );
-    result.closeSync();
+    try {
+      const readerFunction = file.type === "parquet" ? "read_parquet" : "read_csv_auto";
+      const options = file.type === "tsv" ? ", delim='\\t'" : "";
+      const result = await connection.run(
+        `CREATE OR REPLACE VIEW ${quoteIdentifier(viewName(file, files))} AS SELECT * FROM ${readerFunction}(${quoteString(escapeGlob(file.path))}${options})`
+      );
+      result.closeSync();
+    } catch (error) {
+      fileErrors.set(file.path, errorMessage(error));
+    }
   }
+  return fileErrors;
+}
+
+async function readSchema(connection: DuckDbConnection, tableExpression: string): Promise<string[]> {
+  const schema = await readQuery(connection, `DESCRIBE SELECT * FROM ${tableExpression}`);
+  return schema.rows.flatMap((row) => typeof row.column_name === "string" ? [row.column_name] : []);
 }
 
 function quoteIdentifier(identifier: string): string {

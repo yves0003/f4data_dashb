@@ -83,6 +83,9 @@ When a source changes while a dashboard is open, it keeps using its current snap
 
 - `f4datadashb.duckdbMaxConcurrency` limits simultaneous connections (default `4`).
 - `f4datadashb.duckdbIdleReleaseSeconds` closes an idle instance after 120 seconds by default; `0` disables the timeout.
+- `f4datadashb.previewRows` controls initial samples (default `100`, preserving the existing message shape); set it to `0` to return column names without sample rows.
 - Use **F4Data Dashboards: Release Dashboard Database** before replacing a DuckDB file while its dashboard is open. The command closes the current instance; the next query opens the updated file. If local copies are enabled, use **Update local copy** after replacing the source.
 
 Reusing an instance retains DuckDB's native memory and may keep database files open while the dashboard is active. The actual memory overhead and speedup depend on the database and query workload; no UNC benchmark or stable cross-platform memory measurement was available for this change. The setting is therefore opt-in.
+
+Initial column names are obtained with `DESCRIBE`; an optional sample is then fetched up to `previewRows`. If one data file cannot be opened, its dataset reports an error while other valid sources remain available. Data watcher events are debounced for one second, and WAL/temporary-file events are ignored.

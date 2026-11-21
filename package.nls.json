@@ -20,5 +20,6 @@
   "setting.localCopyKeep.description": "Keep local copies for this VS Code session, or for N days after last use (for example, days:7).",
   "setting.reuseDuckDbInstance.description": "Reuse one DuckDB instance while a dashboard is open. Can keep source database files locked until released or idle timeout.",
   "setting.duckdbIdleReleaseSeconds.description": "Close an idle reused DuckDB instance after this many seconds. Set to 0 to disable the idle timeout.",
-  "setting.duckdbMaxConcurrency.description": "Maximum simultaneous DuckDB connections for a reused dashboard instance."
+  "setting.duckdbMaxConcurrency.description": "Maximum simultaneous DuckDB connections for a reused dashboard instance.",
+  "setting.previewRows.description": "Maximum number of rows sampled for each initial dataset preview. Set to 0 to return schema only."
 }
