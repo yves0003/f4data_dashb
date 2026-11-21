@@ -57,6 +57,16 @@ type QueryCacheEntry = {
   columns: string[];
 };
 
+type CachedResult = InitialData | QueryCacheEntry;
+
+interface ResultCacheEntry {
+  fingerprint: string;
+  value: CachedResult;
+  bytes: number;
+}
+
+const RESULT_CACHE_MAX_BYTES = 8 * 1024 * 1024;
+
 type DuckDbConnection = Awaited<ReturnType<DuckDBInstance["connect"]>>;
 
 interface DatabaseSession {
@@ -80,8 +90,10 @@ interface DatabaseSession {
 }
 
 export class DuckDbService {
-  private readonly cache = new Map<string, Map<string, QueryCacheEntry>>();
-  private readonly initialCache = new Map<string, { fingerprint: string; data: InitialData }>();
+  private readonly resultCache = new Map<string, ResultCacheEntry>();
+  private readonly pendingOperations = new Map<string, Promise<unknown>>();
+  private readonly cacheGenerations = new Map<string, number>();
+  private cacheBytes = 0;
   private readonly sessions = new Map<string, DatabaseSession>();
   private readonly pendingSessions = new Map<string, Promise<DatabaseSession>>();
   private readonly dashboardReferences = new Map<string, number>();
@@ -95,71 +107,76 @@ export class DuckDbService {
   ): Promise<InitialData> {
     const files = resolveDataFiles(dashboardPath, dataRootOverride);
     const fingerprint = getFingerprint(files);
-    const cacheKey = `${dashboardCacheKey(dashboardPath, dataRootOverride)}\0preview:${previewRows}`;
-    const cached = !force ? this.initialCache.get(cacheKey) : undefined;
-    if (cached?.fingerprint === fingerprint) {
-      return JSON.parse(JSON.stringify(cached.data)) as InitialData;
+    const cacheKey = `${dashboardCacheKey(dashboardPath, dataRootOverride)}\0initial:${previewRows}`;
+    const cached = !force ? this.getCached<InitialData>(cacheKey, fingerprint) : undefined;
+    if (cached) {
+      return JSON.parse(JSON.stringify(cached)) as InitialData;
     }
 
-    const datasets = await this.withDatabase(files, async (connection, fileErrors) => {
-      const results: DatasetResult[] = [];
-      for (const file of files) {
-        const setupError = fileErrors.get(file.path);
-        if (setupError) {
-          results.push({ name: file.name, columns: [], rows: [], error: setupError });
-          continue;
-        }
-        try {
-          if (file.type === "duckdb") {
-            const tables = await readQuery(connection, "SHOW ALL TABLES");
-            const alias = databaseAlias(file, files);
-            const tableRows = tables.rows.filter((row) => row.database === alias);
-            for (const tableRow of tableRows) {
-              const tableName = typeof tableRow.name === "string" ? tableRow.name : "";
-              if (tableName) {
-                const schema = typeof tableRow.schema === "string" ? tableRow.schema : "main";
-                const tablePath = `${quoteIdentifier(alias)}.${quoteIdentifier(schema)}.${quoteIdentifier(tableName)}`;
-                const columns = await readSchema(connection, tablePath);
-                const rows = previewRows > 0
-                  ? (await readQuery(connection, `SELECT * FROM ${tablePath} LIMIT ${previewRows}`)).rows
-                  : [];
-                results.push({
-                  name: `${file.alias ? `${file.alias}: ` : `${file.name}: `}${tableName}`,
-                  columns,
-                  rows
-                });
+    const generation = this.cacheGeneration(dashboardPath);
+    return this.deduplicate(cacheKey, fingerprint, async () => {
+      const datasets = await this.withDatabase(files, async (connection, fileErrors) => {
+        const results: DatasetResult[] = [];
+        for (const file of files) {
+          const setupError = fileErrors.get(file.path);
+          if (setupError) {
+            results.push({ name: file.name, columns: [], rows: [], error: setupError });
+            continue;
+          }
+          try {
+            if (file.type === "duckdb") {
+              const tables = await readQuery(connection, "SHOW ALL TABLES");
+              const alias = databaseAlias(file, files);
+              const tableRows = tables.rows.filter((row) => row.database === alias);
+              for (const tableRow of tableRows) {
+                const tableName = typeof tableRow.name === "string" ? tableRow.name : "";
+                if (tableName) {
+                  const schema = typeof tableRow.schema === "string" ? tableRow.schema : "main";
+                  const tablePath = `${quoteIdentifier(alias)}.${quoteIdentifier(schema)}.${quoteIdentifier(tableName)}`;
+                  const columns = await readSchema(connection, tablePath);
+                  const rows = previewRows > 0
+                    ? (await readQuery(connection, `SELECT * FROM ${tablePath} LIMIT ${previewRows}`)).rows
+                    : [];
+                  results.push({
+                    name: `${file.alias ? `${file.alias}: ` : `${file.name}: `}${tableName}`,
+                    columns,
+                    rows
+                  });
+                }
               }
+            } else {
+              const view = quoteIdentifier(viewName(file, files));
+              const columns = await readSchema(connection, view);
+              const rows = previewRows > 0
+                ? (await readQuery(connection, `SELECT * FROM ${view} LIMIT ${previewRows}`)).rows
+                : [];
+              results.push({
+                name: file.alias ?? file.name,
+                columns,
+                rows
+              });
             }
-          } else {
-            const view = quoteIdentifier(viewName(file, files));
-            const columns = await readSchema(connection, view);
-            const rows = previewRows > 0
-              ? (await readQuery(connection, `SELECT * FROM ${view} LIMIT ${previewRows}`)).rows
-              : [];
+          } catch (error) {
             results.push({
-              name: file.alias ?? file.name,
-              columns,
-              rows
+              name: file.name,
+              columns: [],
+              rows: [],
+              error: errorMessage(error)
             });
           }
-        } catch (error) {
-          results.push({
-            name: file.name,
-            columns: [],
-            rows: [],
-            error: errorMessage(error)
-          });
         }
-      }
-      return results;
-    }, dashboardPath, dataRootOverride, sessionOptions);
+        return results;
+      }, dashboardPath, dataRootOverride, sessionOptions);
 
-    const data: InitialData = {
-      files: files.map((file) => file.alias ? `${file.alias} (${file.name})` : file.name),
-      datasets
-    };
-    this.initialCache.set(cacheKey, { fingerprint, data });
-    return data;
+      const data: InitialData = {
+        files: files.map((file) => file.alias ? `${file.alias} (${file.name})` : file.name),
+        datasets
+      };
+      if (this.cacheGeneration(dashboardPath) === generation) {
+        this.setCached(cacheKey, fingerprint, data);
+      }
+      return data;
+    });
   }
 
   async query(
@@ -171,32 +188,34 @@ export class DuckDbService {
   ): Promise<QueryCacheEntry> {
     const files = resolveDataFiles(dashboardPath, dataRootOverride);
     const fingerprint = getFingerprint(files);
-    const cache = this.dashboardCache(dashboardPath, dataRootOverride);
-    const key = sql.trim();
-    const cached = !force ? cache.get(key) : undefined;
-    if (cached?.fingerprint === fingerprint) {
+    const key = `${dashboardCacheKey(dashboardPath, dataRootOverride)}\0query:${sql.trim()}`;
+    const cached = !force ? this.getCached<QueryCacheEntry>(key, fingerprint) : undefined;
+    if (cached) {
       return cached;
     }
 
-    const result = await this.withDatabase(files, async (connection) => {
-      return readQuery(connection, sql);
-    }, dashboardPath, dataRootOverride, sessionOptions);
-    cache.set(key, { fingerprint, ...result });
-    while (cache.size > 20) {
-      const oldestKey = cache.keys().next().value;
-      if (oldestKey === undefined) {
-        break;
+    const generation = this.cacheGeneration(dashboardPath);
+    return this.deduplicate(key, fingerprint, async () => {
+      const result = await this.withDatabase(files, async (connection) => {
+        return readQuery(connection, sql);
+      }, dashboardPath, dataRootOverride, sessionOptions);
+      const entry = { fingerprint, ...result };
+      if (this.cacheGeneration(dashboardPath) === generation) {
+        this.setCached(key, fingerprint, entry);
       }
-      cache.delete(oldestKey);
-    }
-    return { fingerprint, ...result };
+      return entry;
+    });
   }
 
   async invalidate(dashboardPath: string, dataRootOverride?: string): Promise<void> {
+    this.cacheGenerations.set(
+      path.resolve(dashboardPath),
+      this.cacheGeneration(dashboardPath) + 1
+    );
     if (dataRootOverride) {
       const key = dashboardCacheKey(dashboardPath, dataRootOverride);
-      this.cache.delete(key);
-      this.initialCache.delete(key);
+      this.clearCached(`${key}\0`);
+      this.clearPending(`${key}\0`);
       const session = this.sessions.get(key);
       if (session) {
         await this.closeSession(session);
@@ -204,16 +223,8 @@ export class DuckDbService {
       return;
     }
     const prefix = `${path.resolve(dashboardPath)}\0`;
-    for (const key of this.cache.keys()) {
-      if (key.startsWith(prefix)) {
-        this.cache.delete(key);
-      }
-    }
-    for (const key of this.initialCache.keys()) {
-      if (key.startsWith(prefix)) {
-        this.initialCache.delete(key);
-      }
-    }
+    this.clearCached(prefix);
+    this.clearPending(prefix);
     const sessions = [...this.sessions.values()].filter((session) => session.key.startsWith(prefix));
     await Promise.all(sessions.map((session) => this.closeSession(session)));
   }
@@ -252,6 +263,9 @@ export class DuckDbService {
     const sessions = [...this.sessions.values()];
     await Promise.all(sessions.map((session) => this.closeSession(session)));
     this.dashboardReferences.clear();
+    this.clearCached("");
+    this.pendingOperations.clear();
+    this.cacheGenerations.clear();
   }
 
   getDataWatchPatterns(dashboardPath: string, dataRootOverride?: string): DataWatchPattern[] {
@@ -263,14 +277,87 @@ export class DuckDbService {
     return [...directories].map((basePath) => ({ basePath, pattern: "**/*" }));
   }
 
-  private dashboardCache(dashboardPath: string, dataRootOverride?: string): Map<string, QueryCacheEntry> {
-    const key = dashboardCacheKey(dashboardPath, dataRootOverride);
-    let cache = this.cache.get(key);
-    if (!cache) {
-      cache = new Map();
-      this.cache.set(key, cache);
+  private getCached<T extends CachedResult>(key: string, fingerprint: string): T | undefined {
+    const entry = this.resultCache.get(key);
+    if (!entry || entry.fingerprint !== fingerprint) {
+      if (entry) {
+        this.deleteCached(key);
+      }
+      return undefined;
     }
-    return cache;
+    this.resultCache.delete(key);
+    this.resultCache.set(key, entry);
+    return entry.value as T;
+  }
+
+  private setCached(key: string, fingerprint: string, value: CachedResult): void {
+    this.deleteCached(key);
+    const serialized = JSON.stringify(value);
+    if (serialized === undefined) {
+      throw new Error("DuckDB result cannot be serialized for caching");
+    }
+    const bytes = Buffer.byteLength(key, "utf8") + Buffer.byteLength(serialized, "utf8");
+    if (bytes > RESULT_CACHE_MAX_BYTES) {
+      return;
+    }
+    while (this.cacheBytes + bytes > RESULT_CACHE_MAX_BYTES) {
+      const oldestKey = this.resultCache.keys().next().value;
+      if (oldestKey === undefined) {
+        break;
+      }
+      this.deleteCached(oldestKey);
+    }
+    this.resultCache.set(key, { fingerprint, value, bytes });
+    this.cacheBytes += bytes;
+  }
+
+  private deleteCached(key: string): void {
+    const entry = this.resultCache.get(key);
+    if (entry) {
+      this.resultCache.delete(key);
+      this.cacheBytes -= entry.bytes;
+    }
+  }
+
+  private clearCached(prefix: string): void {
+    for (const key of this.resultCache.keys()) {
+      if (key.startsWith(prefix)) {
+        this.deleteCached(key);
+      }
+    }
+  }
+
+  private clearPending(prefix: string): void {
+    for (const key of this.pendingOperations.keys()) {
+      if (key.startsWith(prefix)) {
+        this.pendingOperations.delete(key);
+      }
+    }
+  }
+
+  private cacheGeneration(dashboardPath: string): number {
+    return this.cacheGenerations.get(path.resolve(dashboardPath)) ?? 0;
+  }
+
+  private async deduplicate<T>(
+    key: string,
+    fingerprint: string,
+    operation: () => Promise<T>
+  ): Promise<T> {
+    const pendingKey = `${key}\0${fingerprint}`;
+    const pending = this.pendingOperations.get(pendingKey);
+    if (pending) {
+      return pending as Promise<T>;
+    }
+    const current = operation();
+    this.pendingOperations.set(pendingKey, current);
+    try {
+      return await current;
+    } finally {
+      if (this.pendingOperations.get(pendingKey) === current) {
+        this.pendingOperations.delete(pendingKey);
+      }
+    }
   }
 
   private async withDatabase<T>(

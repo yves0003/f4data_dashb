@@ -21,3 +21,9 @@
 - Added `f4datadashb.previewRows` (default `100` for compatibility; `0` requests only schema), obtain column names through `DESCRIBE`, and isolate an invalid source file to its own dataset error.
 - Data-source watcher notifications are debounced by one second and WAL/temporary files are ignored.
 - Automated tests check schema-only mode, the default 100-row sample, an invalid DuckDB file alongside a valid CSV, and watcher filtering.
+
+### Bounded result caching
+
+- Query results and initial previews now share an 8 MiB byte-bounded LRU cache; oversized individual results are returned without being retained.
+- Concurrent identical operations are deduplicated, and invalidation prevents in-flight stale results from repopulating the cache.
+- Automated tests verify concurrent query deduplication, cache reuse, and LRU eviction after the aggregate result size exceeds the budget.
