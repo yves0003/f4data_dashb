@@ -14,6 +14,12 @@ export interface DataWatchPattern {
   pattern: string;
 }
 
+export interface DuckDbRuntimeOptions {
+  reuseInstance: boolean;
+  idleReleaseSeconds: number;
+  maxConcurrency: number;
+}
+
 interface DataSourceConfig {
   name: string;
   path: string;
@@ -38,14 +44,39 @@ type QueryCacheEntry = {
   columns: string[];
 };
 
+type DuckDbConnection = Awaited<ReturnType<DuckDBInstance["connect"]>>;
+
+interface DatabaseSession {
+  key: string;
+  fingerprint: string;
+  instance: DuckDBInstance;
+  connections: DuckDbConnection[];
+  busyConnections: Set<DuckDbConnection>;
+  waiting: Array<{
+    resolve(connection: DuckDbConnection): void;
+    reject(error: Error): void;
+  }>;
+  connectionCreations: number;
+  idleTimer?: NodeJS.Timeout;
+  closing: boolean;
+  closed: boolean;
+  closePromise?: Promise<void>;
+  resolveClose?: () => void;
+  rejectClose?: (error: Error) => void;
+}
+
 export class DuckDbService {
   private readonly cache = new Map<string, Map<string, QueryCacheEntry>>();
   private readonly initialCache = new Map<string, { fingerprint: string; data: InitialData }>();
+  private readonly sessions = new Map<string, DatabaseSession>();
+  private readonly pendingSessions = new Map<string, Promise<DatabaseSession>>();
+  private readonly dashboardReferences = new Map<string, number>();
 
   async loadInitialData(
     dashboardPath: string,
     force = false,
-    dataRootOverride?: string
+    dataRootOverride?: string,
+    sessionOptions?: DuckDbRuntimeOptions
   ): Promise<InitialData> {
     const files = resolveDataFiles(dashboardPath, dataRootOverride);
     const fingerprint = getFingerprint(files);
@@ -96,7 +127,7 @@ export class DuckDbService {
         }
       }
       return results;
-    });
+    }, dashboardPath, dataRootOverride, sessionOptions);
 
     const data: InitialData = {
       files: files.map((file) => file.alias ? `${file.alias} (${file.name})` : file.name),
@@ -110,7 +141,8 @@ export class DuckDbService {
     dashboardPath: string,
     sql: string,
     force = false,
-    dataRootOverride?: string
+    dataRootOverride?: string,
+    sessionOptions?: DuckDbRuntimeOptions
   ): Promise<QueryCacheEntry> {
     const files = resolveDataFiles(dashboardPath, dataRootOverride);
     const fingerprint = getFingerprint(files);
@@ -123,7 +155,7 @@ export class DuckDbService {
 
     const result = await this.withDatabase(files, async (connection) => {
       return readQuery(connection, sql);
-    });
+    }, dashboardPath, dataRootOverride, sessionOptions);
     cache.set(key, { fingerprint, ...result });
     while (cache.size > 20) {
       const oldestKey = cache.keys().next().value;
@@ -135,11 +167,15 @@ export class DuckDbService {
     return { fingerprint, ...result };
   }
 
-  invalidate(dashboardPath: string, dataRootOverride?: string): void {
+  async invalidate(dashboardPath: string, dataRootOverride?: string): Promise<void> {
     if (dataRootOverride) {
       const key = dashboardCacheKey(dashboardPath, dataRootOverride);
       this.cache.delete(key);
       this.initialCache.delete(key);
+      const session = this.sessions.get(key);
+      if (session) {
+        await this.closeSession(session);
+      }
       return;
     }
     const prefix = `${path.resolve(dashboardPath)}\0`;
@@ -153,6 +189,44 @@ export class DuckDbService {
         this.initialCache.delete(key);
       }
     }
+    const sessions = [...this.sessions.values()].filter((session) => session.key.startsWith(prefix));
+    await Promise.all(sessions.map((session) => this.closeSession(session)));
+  }
+
+  retainDashboard(dashboardPath: string, dataRootOverride?: string): { dispose(): Promise<void> } {
+    const key = dashboardCacheKey(dashboardPath, dataRootOverride);
+    this.dashboardReferences.set(key, (this.dashboardReferences.get(key) ?? 0) + 1);
+    let disposed = false;
+    return {
+      dispose: async () => {
+        if (disposed) {
+          return;
+        }
+        disposed = true;
+        const remaining = (this.dashboardReferences.get(key) ?? 1) - 1;
+        if (remaining > 0) {
+          this.dashboardReferences.set(key, remaining);
+          return;
+        }
+        this.dashboardReferences.delete(key);
+        const session = this.sessions.get(key);
+        if (session) {
+          await this.closeSession(session);
+        }
+      }
+    };
+  }
+
+  async releaseDashboard(dashboardPath: string): Promise<void> {
+    const prefix = `${path.resolve(dashboardPath)}\0`;
+    const sessions = [...this.sessions.values()].filter((session) => session.key.startsWith(prefix));
+    await Promise.all(sessions.map((session) => this.closeSession(session)));
+  }
+
+  async dispose(): Promise<void> {
+    const sessions = [...this.sessions.values()];
+    await Promise.all(sessions.map((session) => this.closeSession(session)));
+    this.dashboardReferences.clear();
   }
 
   getDataWatchPatterns(dashboardPath: string, dataRootOverride?: string): DataWatchPattern[] {
@@ -176,29 +250,24 @@ export class DuckDbService {
 
   private async withDatabase<T>(
     files: DataFile[],
-    callback: (connection: Awaited<ReturnType<DuckDBInstance["connect"]>>) => Promise<T>
+    callback: (connection: DuckDbConnection) => Promise<T>,
+    dashboardPath: string,
+    dataRootOverride?: string,
+    sessionOptions?: DuckDbRuntimeOptions
   ): Promise<T> {
+    if (sessionOptions?.reuseInstance) {
+      return this.withPersistentDatabase(
+        files,
+        callback,
+        dashboardCacheKey(dashboardPath, dataRootOverride),
+        sessionOptions
+      );
+    }
     const instance = await DuckDBInstance.create(":memory:");
     let connection: Awaited<ReturnType<DuckDBInstance["connect"]>> | undefined;
     try {
       connection = await instance.connect();
-      for (const file of files.filter((candidate) => candidate.type === "duckdb")) {
-        const result = await connection.run(
-          `ATTACH ${quoteString(file.path)} AS ${quoteIdentifier(databaseAlias(file, files))} (READ_ONLY)`
-        );
-        result.closeSync();
-      }
-      for (const file of files) {
-        if (file.type === "duckdb") {
-          continue;
-        }
-        const readerFunction = file.type === "parquet" ? "read_parquet" : "read_csv_auto";
-        const options = file.type === "tsv" ? ", delim='\\t'" : "";
-        const result = await connection.run(
-          `CREATE OR REPLACE VIEW ${quoteIdentifier(viewName(file, files))} AS SELECT * FROM ${readerFunction}(${quoteString(escapeGlob(file.path))}${options})`
-        );
-        result.closeSync();
-      }
+      await attachFiles(connection, files);
       return await callback(connection);
     } finally {
       try {
@@ -206,6 +275,210 @@ export class DuckDbService {
       } finally {
         instance.closeSync();
       }
+    }
+  }
+
+  private async withPersistentDatabase<T>(
+    files: DataFile[],
+    callback: (connection: DuckDbConnection) => Promise<T>,
+    key: string,
+    options: DuckDbRuntimeOptions
+  ): Promise<T> {
+    const fingerprint = getFingerprint(files);
+    const session = await this.getOrCreateSession(key, fingerprint, files);
+    const connection = await this.acquireConnection(session, options.maxConcurrency);
+    try {
+      return await callback(connection);
+    } finally {
+      this.releaseConnection(session, connection, options.idleReleaseSeconds);
+    }
+  }
+
+  private async getOrCreateSession(
+    key: string,
+    fingerprint: string,
+    files: DataFile[]
+  ): Promise<DatabaseSession> {
+    while (true) {
+      const session = this.sessions.get(key);
+      if (session?.fingerprint === fingerprint && !session.closing) {
+        if (session.idleTimer) {
+          clearTimeout(session.idleTimer);
+          session.idleTimer = undefined;
+        }
+        return session;
+      }
+      if (session) {
+        await this.closeSession(session);
+        continue;
+      }
+      const pending = this.pendingSessions.get(key);
+      if (pending) {
+        const pendingSession = await pending;
+        if (pendingSession.fingerprint === fingerprint && !pendingSession.closing) {
+          return pendingSession;
+        }
+        await this.closeSession(pendingSession);
+        continue;
+      }
+
+      const createSession = this.createSession(key, fingerprint, files);
+      this.pendingSessions.set(key, createSession);
+      try {
+        return await createSession;
+      } finally {
+        if (this.pendingSessions.get(key) === createSession) {
+          this.pendingSessions.delete(key);
+        }
+      }
+    }
+  }
+
+  private async createSession(
+    key: string,
+    fingerprint: string,
+    files: DataFile[]
+  ): Promise<DatabaseSession> {
+    const instance = await DuckDBInstance.create(":memory:");
+    let connection: DuckDbConnection | undefined;
+    try {
+      connection = await instance.connect();
+      await attachFiles(connection, files);
+      const session: DatabaseSession = {
+        key,
+        fingerprint,
+        instance,
+        connections: [connection],
+        busyConnections: new Set(),
+        waiting: [],
+        connectionCreations: 0,
+        closing: false,
+        closed: false
+      };
+      this.sessions.set(key, session);
+      return session;
+    } catch (error) {
+      try {
+        connection?.closeSync();
+      } finally {
+        instance.closeSync();
+      }
+      throw error;
+    }
+  }
+
+  private async acquireConnection(session: DatabaseSession, maxConcurrency: number): Promise<DuckDbConnection> {
+    if (session.closing) {
+      throw new Error("DuckDB dashboard session is closing");
+    }
+    if (session.idleTimer) {
+      clearTimeout(session.idleTimer);
+      session.idleTimer = undefined;
+    }
+    const idle = session.connections.find((connection) => !session.busyConnections.has(connection));
+    if (idle) {
+      session.busyConnections.add(idle);
+      return idle;
+    }
+    if (session.connections.length + session.connectionCreations < maxConcurrency) {
+      session.connectionCreations++;
+      try {
+        const connection = await session.instance.connect();
+        if (session.closing) {
+          connection.closeSync();
+          if (session.connectionCreations === 1 && session.busyConnections.size === 0) {
+            this.finishCloseSession(session);
+          }
+          throw new Error("DuckDB dashboard session is closing");
+        }
+        session.connections.push(connection);
+        session.busyConnections.add(connection);
+        return connection;
+      } finally {
+        session.connectionCreations--;
+        if (session.closing && session.connectionCreations === 0 && session.busyConnections.size === 0) {
+          this.finishCloseSession(session);
+        }
+      }
+    }
+    return new Promise((resolve, reject) => session.waiting.push({ resolve, reject }));
+  }
+
+  private releaseConnection(
+    session: DatabaseSession,
+    connection: DuckDbConnection,
+    idleReleaseSeconds: number
+  ): void {
+    session.busyConnections.delete(connection);
+    const next = session.waiting.shift();
+    if (next && !session.closing) {
+      session.busyConnections.add(connection);
+      next.resolve(connection);
+      return;
+    }
+    if (session.closing && session.busyConnections.size === 0 && session.connectionCreations === 0) {
+      this.finishCloseSession(session);
+      return;
+    }
+    if (session.busyConnections.size === 0 && idleReleaseSeconds > 0) {
+      session.idleTimer = setTimeout(() => {
+        void this.closeSession(session);
+      }, idleReleaseSeconds * 1000);
+    }
+  }
+
+  private async closeSession(session: DatabaseSession): Promise<void> {
+    if (session.closePromise) {
+      return session.closePromise;
+    }
+    session.closing = true;
+    session.closePromise = new Promise<void>((resolve, reject) => {
+      session.resolveClose = resolve;
+      session.rejectClose = reject;
+    });
+    if (session.idleTimer) {
+      clearTimeout(session.idleTimer);
+      session.idleTimer = undefined;
+    }
+    if (this.sessions.get(session.key) === session) {
+      this.sessions.delete(session.key);
+    }
+    session.waiting.splice(0).forEach((waiter) => {
+      waiter.reject(new Error("DuckDB dashboard session is closing"));
+    });
+    if (session.busyConnections.size === 0 && session.connectionCreations === 0) {
+      this.finishCloseSession(session);
+    }
+    return session.closePromise;
+  }
+
+  private finishCloseSession(session: DatabaseSession): void {
+    if (session.closed) {
+      return;
+    }
+    if (session.idleTimer) {
+      clearTimeout(session.idleTimer);
+      session.idleTimer = undefined;
+    }
+    let closeError: unknown;
+    for (const connection of session.connections) {
+      try {
+        connection.closeSync();
+      } catch (error) {
+        closeError ??= error;
+      }
+    }
+    session.connections.length = 0;
+    try {
+      session.instance.closeSync();
+    } catch (error) {
+      closeError ??= error;
+    }
+    session.closed = true;
+    if (closeError) {
+      session.rejectClose?.(closeError instanceof Error ? closeError : new Error(String(closeError)));
+    } else {
+      session.resolveClose?.();
     }
   }
 }
@@ -374,6 +647,26 @@ function databaseAlias(file: DataFile, files: DataFile[]): string {
     return file.alias;
   }
   return `db_${files.indexOf(file)}_${path.basename(file.name, path.extname(file.name)).replace(/[^a-zA-Z0-9_]/g, "_")}`;
+}
+
+async function attachFiles(connection: DuckDbConnection, files: DataFile[]): Promise<void> {
+  for (const file of files.filter((candidate) => candidate.type === "duckdb")) {
+    const result = await connection.run(
+      `ATTACH ${quoteString(file.path)} AS ${quoteIdentifier(databaseAlias(file, files))} (READ_ONLY)`
+    );
+    result.closeSync();
+  }
+  for (const file of files) {
+    if (file.type === "duckdb") {
+      continue;
+    }
+    const readerFunction = file.type === "parquet" ? "read_parquet" : "read_csv_auto";
+    const options = file.type === "tsv" ? ", delim='\\t'" : "";
+    const result = await connection.run(
+      `CREATE OR REPLACE VIEW ${quoteIdentifier(viewName(file, files))} AS SELECT * FROM ${readerFunction}(${quoteString(escapeGlob(file.path))}${options})`
+    );
+    result.closeSync();
+  }
 }
 
 function quoteIdentifier(identifier: string): string {

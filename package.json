@@ -23,7 +23,8 @@
     "onCommand:f4datadashb.generateDashboardInFolder",
     "onCommand:f4datadashb.removeDashboard",
     "onCommand:f4datadashb.openDashboard",
-    "onCommand:f4datadashb.clearLocalCopies"
+    "onCommand:f4datadashb.clearLocalCopies",
+    "onCommand:f4datadashb.releaseDashboardDatabase"
   ],
   "main": "./out/extension.js",
   "contributes": {
@@ -77,6 +78,10 @@
       {
         "command": "f4datadashb.clearLocalCopies",
         "title": "%command.clearLocalCopies%"
+      },
+      {
+        "command": "f4datadashb.releaseDashboardDatabase",
+        "title": "%command.releaseDashboardDatabase%"
       }
     ],
     "configuration": {
@@ -104,6 +109,24 @@
           "pattern": "^(session|days:[0-9]+)$",
           "default": "days:7",
           "description": "%setting.localCopyKeep.description%"
+        },
+        "f4datadashb.reuseDuckDbInstance": {
+          "type": "boolean",
+          "default": false,
+          "description": "%setting.reuseDuckDbInstance.description%"
+        },
+        "f4datadashb.duckdbIdleReleaseSeconds": {
+          "type": "integer",
+          "minimum": 0,
+          "default": 120,
+          "description": "%setting.duckdbIdleReleaseSeconds.description%"
+        },
+        "f4datadashb.duckdbMaxConcurrency": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 16,
+          "default": 4,
+          "description": "%setting.duckdbMaxConcurrency.description%"
         }
       }
     },
@@ -135,6 +158,11 @@
         },
         {
           "command": "f4datadashb.removeDashboard",
+          "when": "view == f4datadashb.dashboards && viewItem == f4datadashb.dashboardItem",
+          "group": "navigation"
+        },
+        {
+          "command": "f4datadashb.releaseDashboardDatabase",
           "when": "view == f4datadashb.dashboards && viewItem == f4datadashb.dashboardItem",
           "group": "navigation"
         }

@@ -8,11 +8,14 @@ import { DuckDbService } from "./duckdbService";
 import { translate } from "./i18n";
 import { LocalCopyService, readLocalCopyOptions } from "./localCopyService";
 
+let activeDuckDbService: DuckDbService | undefined;
+
 export function activate(context: vscode.ExtensionContext): void {
   const language = vscode.env.language;
   const t = (key: Parameters<typeof translate>[1], ...values: string[]) => translate(language, key, ...values);
   const tree = new DashboardTreeProvider(context.globalState, language);
   const duckDb = new DuckDbService();
+  activeDuckDbService = duckDb;
   const localCopies = new LocalCopyService();
   const webviews = new DashboardWebviewManager(context, duckDb, language, localCopies);
   const treeView = vscode.window.createTreeView("f4datadashb.dashboards", { treeDataProvider: tree });
@@ -138,6 +141,17 @@ export function activate(context: vscode.ExtensionContext): void {
         void vscode.window.showErrorMessage(t("localCopyFailed", errorMessage(error)));
       }
     }),
+    vscode.commands.registerCommand("f4datadashb.releaseDashboardDatabase", async (item?: DashboardTreeItem) => {
+      if (!item?.dashboard) {
+        return;
+      }
+      try {
+        await duckDb.releaseDashboard(item.dashboard.path);
+        void vscode.window.showInformationMessage(t("dashboardDatabaseReleased", item.dashboard.displayName));
+      } catch (error) {
+        void vscode.window.showErrorMessage(t("releaseDatabaseFailed", errorMessage(error)));
+      }
+    }),
     vscode.commands.registerCommand("f4datadashb.openDashboard", async (item?: DashboardTreeItem) => {
       const dashboard = item?.dashboard;
       if (!dashboard) {
@@ -158,7 +172,11 @@ export function activate(context: vscode.ExtensionContext): void {
   );
 }
 
-export function deactivate(): void {}
+export async function deactivate(): Promise<void> {
+  const service = activeDuckDbService;
+  activeDuckDbService = undefined;
+  await service?.dispose();
+}
 
 type Translator = (key: Parameters<typeof translate>[1], ...values: string[]) => string;
 type DashboardFramework = "react" | "vanilla";

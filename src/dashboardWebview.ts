@@ -2,7 +2,7 @@ import { randomBytes } from "node:crypto";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import * as vscode from "vscode";
-import { DuckDbService } from "./duckdbService";
+import { DuckDbRuntimeOptions, DuckDbService } from "./duckdbService";
 import { MessageKey, translate } from "./i18n";
 import {
   InsufficientCopySpaceError,
@@ -26,8 +26,12 @@ export class DashboardWebviewManager {
     if (!fs.existsSync(path.join(vuePath, "index.html"))) {
       throw new Error(translate(this.language, "dashboardNotReady"));
     }
+    const databaseOptions = readDuckDbRuntimeOptions();
     let activeCopy = await this.prepareLocalCopy(resolvedPath);
     let activeDataPath = activeCopy?.dataPath;
+    let databaseLease = databaseOptions.reuseInstance
+      ? this.duckDb.retainDashboard(resolvedPath, activeDataPath)
+      : undefined;
     const dataWatchPatterns = this.duckDb.getDataWatchPatterns(resolvedPath, activeDataPath);
     let panel: vscode.WebviewPanel;
     try {
@@ -41,6 +45,7 @@ export class DashboardWebviewManager {
         }
       );
     } catch (error) {
+      await databaseLease?.dispose();
       await activeCopy?.dispose();
       throw error;
     }
@@ -71,17 +76,26 @@ export class DashboardWebviewManager {
 
     const sendInitialData = async (force: boolean): Promise<void> => {
       try {
-        const data = await this.duckDb.loadInitialData(resolvedPath, force, activeDataPath);
+        const data = await this.duckDb.loadInitialData(
+          resolvedPath,
+          force,
+          activeDataPath,
+          databaseOptions
+        );
         await panel.webview.postMessage({ command: "initData", data });
       } catch (error) {
         await this.sendError(panel.webview, error);
       }
     };
 
-    const invalidateData = (): void => {
-      this.duckDb.invalidate(resolvedPath, activeDataPath);
-      if (ready) {
-        void sendInitialData(true);
+    const invalidateData = async (): Promise<void> => {
+      try {
+        await this.duckDb.invalidate(resolvedPath, activeDataPath);
+        if (ready) {
+          await sendInitialData(true);
+        }
+      } catch (error) {
+        await this.sendError(panel.webview, error);
       }
     };
 
@@ -91,10 +105,14 @@ export class DashboardWebviewManager {
         await nextCopy?.dispose();
         return;
       }
+      await this.duckDb.invalidate(resolvedPath);
+      await databaseLease?.dispose();
       const previousCopy = activeCopy;
       activeCopy = nextCopy;
       activeDataPath = nextCopy.dataPath;
-      this.duckDb.invalidate(resolvedPath);
+      databaseLease = databaseOptions.reuseInstance
+        ? this.duckDb.retainDashboard(resolvedPath, activeDataPath)
+        : undefined;
       await previousCopy?.dispose();
       if (ready) {
         await sendInitialData(true);
@@ -130,7 +148,11 @@ export class DashboardWebviewManager {
         clearTimeout(sourceChangeTimer);
       }
       sourceChangeTimer = setTimeout(() => {
-        void promptForCopyUpdate();
+        void promptForCopyUpdate().catch((error: unknown) => {
+          void vscode.window.showErrorMessage(
+            translate(this.language, "localCopyFailed", errorMessage(error))
+          );
+        });
       }, 1000);
     };
 
@@ -147,9 +169,9 @@ export class DashboardWebviewManager {
         sourceWatcher.onDidDelete(scheduleCopyUpdatePrompt)
       ] : []),
       ...dataWatchers.flatMap((watcher) => [
-        watcher.onDidChange(invalidateData),
-        watcher.onDidCreate(invalidateData),
-        watcher.onDidDelete(invalidateData)
+        watcher.onDidChange(() => { void invalidateData(); }),
+        watcher.onDidCreate(() => { void invalidateData(); }),
+        watcher.onDidDelete(() => { void invalidateData(); })
       ]),
       panel.webview.onDidReceiveMessage(async (message: unknown) => {
         if (!isWebviewMessage(message)) {
@@ -161,7 +183,7 @@ export class DashboardWebviewManager {
           return;
         }
         if (message.command === "refresh") {
-          this.duckDb.invalidate(resolvedPath, activeDataPath);
+          await this.duckDb.invalidate(resolvedPath, activeDataPath);
           await sendInitialData(true);
           return;
         }
@@ -171,7 +193,8 @@ export class DashboardWebviewManager {
               resolvedPath,
               message.sql,
               message.force === true,
-              activeDataPath
+              activeDataPath,
+              databaseOptions
             );
             await panel.webview.postMessage({
               command: "queryResult",
@@ -193,7 +216,10 @@ export class DashboardWebviewManager {
         if (sourceChangeTimer) {
           clearTimeout(sourceChangeTimer);
         }
-        void activeCopy?.dispose().catch((error: unknown) => {
+        void (async () => {
+          await databaseLease?.dispose();
+          await activeCopy?.dispose();
+        })().catch((error: unknown) => {
           void vscode.window.showErrorMessage(
             translate(this.language, "localCopyFailed", errorMessage(error))
           );
@@ -321,4 +347,21 @@ function errorMessage(error: unknown): string {
 
 function formatBytes(bytes: number): string {
   return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+}
+
+function readDuckDbRuntimeOptions(): DuckDbRuntimeOptions {
+  const configuration = vscode.workspace.getConfiguration("f4datadashb");
+  const reuseInstance = configuration.get<unknown>("reuseDuckDbInstance", false);
+  const idleReleaseSeconds = configuration.get<unknown>("duckdbIdleReleaseSeconds", 120);
+  const maxConcurrency = configuration.get<unknown>("duckdbMaxConcurrency", 4);
+  if (typeof reuseInstance !== "boolean") {
+    throw new Error("f4datadashb.reuseDuckDbInstance must be a boolean");
+  }
+  if (typeof idleReleaseSeconds !== "number" || !Number.isInteger(idleReleaseSeconds) || idleReleaseSeconds < 0) {
+    throw new Error("f4datadashb.duckdbIdleReleaseSeconds must be a non-negative integer");
+  }
+  if (typeof maxConcurrency !== "number" || !Number.isInteger(maxConcurrency) || maxConcurrency < 1) {
+    throw new Error("f4datadashb.duckdbMaxConcurrency must be a positive integer");
+  }
+  return { reuseInstance, idleReleaseSeconds, maxConcurrency };
 }

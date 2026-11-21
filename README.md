@@ -76,3 +76,13 @@ DuckDB files are copied with DuckDB's read-only database-copy operation into a t
 `f4datadashb.localCopyKeep` controls retention: `session` removes a snapshot when the last dashboard using it in that VS Code extension process closes; `days:N` (default `days:7`) keeps it for N days after last use so it can be reused. A PID lock protects snapshots used by another VS Code window. Old snapshots and stale locks are cleaned on startup when local copies are enabled. Use **F4Data Dashboards: Clear Unused Local Data Copies** to remove inactive copies manually; active copies are left alone.
 
 When a source changes while a dashboard is open, it keeps using its current snapshot and offers **Update local copy** instead of silently recopying a large database. The extension stores snapshots outside the dashboard and its data folder: in `%LOCALAPPDATA%` on Windows, `~/Library/Caches` on macOS, and `$XDG_CACHE_HOME` or `~/.cache` on Linux.
+
+## Reusing DuckDB connections
+
+`f4datadashb.reuseDuckDbInstance` is `false` by default, preserving the existing per-operation connection lifecycle. When enabled, a dashboard reuses one DuckDB instance, prepares its views/attachments once, and uses a bounded pool of connections for concurrent queries.
+
+- `f4datadashb.duckdbMaxConcurrency` limits simultaneous connections (default `4`).
+- `f4datadashb.duckdbIdleReleaseSeconds` closes an idle instance after 120 seconds by default; `0` disables the timeout.
+- Use **F4Data Dashboards: Release Dashboard Database** before replacing a DuckDB file while its dashboard is open. The command closes the current instance; the next query opens the updated file. If local copies are enabled, use **Update local copy** after replacing the source.
+
+Reusing an instance retains DuckDB's native memory and may keep database files open while the dashboard is active. The actual memory overhead and speedup depend on the database and query workload; no UNC benchmark or stable cross-platform memory measurement was available for this change. The setting is therefore opt-in.

@@ -8,3 +8,10 @@
 - DuckDB sources use a read-only DuckDB database copy rather than a raw file copy; CSV, TSV, Parquet, and other files are copied through temporary files and promoted only after integrity checks.
 - Added network-path detection, cancellable progress, low-disk-space checks, retention, PID locks for concurrent VS Code windows, manual cleanup, and an explicit update action when source files change.
 - A local test created and queried a 250,000-row DuckDB table from both the original and copied databases; columns and all returned values matched. No UNC/share benchmark was available in this environment, so no production speedup is claimed.
+
+### Reusable DuckDB sessions
+
+- Added opt-in per-dashboard instance and connection-pool reuse, with a default concurrency cap of four, a 120-second default idle timeout, an explicit database-release command, and extension-deactivation cleanup.
+- Automated tests verify that eight concurrent queries can use the attached database, and that invalidation/release permits reopening a changed database. The option remains disabled by default.
+- Local benchmark only: for five forced `COUNT(*)` queries against a 1,000,000-row, 18.4 MB DuckDB file, median latency was 16.1 ms with a fresh instance per operation and 1.5 ms with a reused instance; the first reused query took 13.8 ms including initialization. Process RSS rose by 0.8 MiB during this small test, an approximate and workload-specific measurement.
+- No after-change UNC benchmark was available. The local result demonstrates a non-negligible reduction in per-operation setup, but does not quantify performance on the user's network share.
