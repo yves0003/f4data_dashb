@@ -83,6 +83,9 @@ test("invalidating a dashboard closes its reused DuckDB session", async () => {
     sourceInstance = undefined;
 
     const service = new DuckDbService();
+    const changedDashboards = [];
+    service.onDidChangeSessions((changedPath) => changedDashboards.push(changedPath));
+    assert.equal(service.hasDashboardSession(dashboardPath), false);
     const first = await service.query(
       dashboardPath,
       'SELECT COUNT(*) AS count FROM "db_0_records".main.records',
@@ -91,7 +94,11 @@ test("invalidating a dashboard closes its reused DuckDB session", async () => {
       sessionOptions
     );
     assert.equal(String(first.rows[0].count), "1");
+    assert.equal(service.hasDashboardSession(dashboardPath), true);
+    assert.deepEqual(changedDashboards, [dashboardPath]);
     await service.invalidate(dashboardPath);
+    assert.equal(service.hasDashboardSession(dashboardPath), false);
+    assert.deepEqual(changedDashboards, [dashboardPath, dashboardPath]);
 
     sourceInstance = await DuckDBInstance.create(databasePath);
     const writerAfterInvalidate = await sourceInstance.connect();

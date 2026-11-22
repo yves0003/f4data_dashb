@@ -12,6 +12,14 @@ export interface DashboardDocument {
   name: string;
 }
 
+export interface StoredDashboardsResult {
+  dashboards: DashboardInfo[];
+  retainedPaths: string[];
+  unavailablePaths: string[];
+  invalidCount: number;
+  unavailableCount: number;
+}
+
 export function listDashboardDocuments(dashboardPath: string): DashboardDocument[] {
   const documentsPath = path.join(normalizePath(dashboardPath), "Documents");
   let directoryStat: fs.Stats;
@@ -36,7 +44,7 @@ export function listDashboardDocuments(dashboardPath: string): DashboardDocument
     throw error;
   }
   return entries
-    .filter((entry) => entry.isFile())
+    .filter((entry) => entry.isFile() && entry.name !== ".DS_Store")
     .map((entry) => ({
       name: entry.name,
       path: path.join(documentsPath, entry.name)
@@ -57,15 +65,17 @@ export function readDashboard(folder: string): DashboardInfo {
   const packagePath = path.join(dashboardPath, "package.json");
   const dataPath = path.join(dashboardPath, "data");
   const vueIndexPath = path.join(dashboardPath, "vue", "index.html");
-  if (!fs.existsSync(packagePath) || !fs.statSync(packagePath).isFile()
-    || !fs.existsSync(dataPath) || !fs.statSync(dataPath).isDirectory()
-    || !fs.existsSync(vueIndexPath) || !fs.statSync(vueIndexPath).isFile()) {
+  if (!fs.statSync(dashboardPath).isDirectory()
+    || !isRequiredPath(packagePath, dashboardPath, (stats) => stats.isFile())
+    || !isRequiredPath(dataPath, dashboardPath, (stats) => stats.isDirectory())
+    || !isRequiredPath(vueIndexPath, dashboardPath, (stats) => stats.isFile())) {
     throw new Error("invalid-dashboard");
   }
 
+  const packageContents = fs.readFileSync(packagePath, "utf8");
   let manifest: Record<string, unknown>;
   try {
-    const parsed: unknown = JSON.parse(fs.readFileSync(packagePath, "utf8"));
+    const parsed: unknown = JSON.parse(packageContents);
     if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
       throw new Error("package.json must contain a JSON object");
     }
@@ -80,6 +90,44 @@ export function readDashboard(folder: string): DashboardInfo {
     displayName: stringField(manifest.displayName) ?? stringField(manifest.title) ?? fallbackName,
     description: stringField(manifest.description) ?? ""
   };
+}
+
+export function readStoredDashboards(storedPaths: readonly string[]): StoredDashboardsResult {
+  const dashboards: DashboardInfo[] = [];
+  const retainedPaths: string[] = [];
+  const unavailablePaths: string[] = [];
+  const seen = new Set<string>();
+  let invalidCount = 0;
+  let unavailableCount = 0;
+
+  for (const storedPath of storedPaths) {
+    const normalizedPath = normalizePath(storedPath);
+    if (seen.has(normalizedPath)) {
+      continue;
+    }
+    seen.add(normalizedPath);
+
+    try {
+      const dashboard = readDashboard(normalizedPath);
+      dashboards.push(dashboard);
+      retainedPaths.push(dashboard.path);
+    } catch (error) {
+      if (isDashboardValidationError(error)) {
+        invalidCount++;
+      } else {
+        unavailableCount++;
+        retainedPaths.push(normalizedPath);
+        unavailablePaths.push(normalizedPath);
+      }
+    }
+  }
+
+  return { dashboards, retainedPaths, unavailablePaths, invalidCount, unavailableCount };
+}
+
+export function isDashboardValidationError(error: unknown): boolean {
+  return error instanceof Error
+    && (error.message === "invalid-dashboard" || error.message.startsWith("invalid-package:"));
 }
 
 export function isDashboard(folder: string): boolean {
@@ -121,4 +169,22 @@ export function findDashboards(selectedFolders: readonly string[]): DashboardInf
 
 function stringField(value: unknown): string | undefined {
   return typeof value === "string" && value.trim() ? value.trim() : undefined;
+}
+
+function isRequiredPath(
+  requiredPath: string,
+  dashboardPath: string,
+  matches: (stats: fs.Stats) => boolean
+): boolean {
+  let stats: fs.Stats;
+  try {
+    stats = fs.statSync(requiredPath);
+  } catch (error) {
+    if (isMissingPathError(error)) {
+      fs.statSync(dashboardPath);
+      return false;
+    }
+    throw error;
+  }
+  return matches(stats);
 }

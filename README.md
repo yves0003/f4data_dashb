@@ -22,9 +22,11 @@ The importer accepts a dashboard folder directly or scans only its immediate chi
 
 Open the **F4Data Dashboards** view from the Activity Bar. Use its **+** action to create a dashboard, or its import action to add an existing dashboard. You can also right-click a folder in the VS Code Explorer and choose **Initialize F4Data Dashboard in This Folder**. Select a dashboard in the view to open it; removing it from the view does not delete its files.
 
-The **Favorites** view shows dashboards marked with the star action beside their row. Favorites are saved in VS Code `globalState`. The dashboard list keeps `screen-full`/`screen-normal` for its open-selection state. In the Favorites view, dashboards show `screen-full`, switching to `screen-normal` when selected. Removing a dashboard from the imported dashboard list also removes it from Favorites.
+The dashboard view shows explicit loading, empty, and loading-error states. Temporarily unavailable dashboards remain saved and are retried; use the refresh action in the view title or on the warning row to retry immediately. The **Diagnose Dashboard** command is available from the Command Palette, the view title, and each dashboard's context menu.
 
-The **Documents** view is a separate section in the F4Data sidebar, below the dashboards view. For each dashboard, it lists and opens regular files found directly in that dashboard's `Documents/` folder. Subfolders and their contents are intentionally ignored. Create `Documents/` if it does not exist; its contents refresh automatically as files are added, changed, or removed.
+The **Favorites** view shows dashboards marked with the star action beside their row. Favorites are saved in VS Code `globalState`. In the main dashboard list, favorites use a star icon and other dashboards use `screen-full`. In the Favorites view, dashboards use `screen-full`. Removing a dashboard from the imported dashboard list also removes it from Favorites.
+
+The **Documents** view is a separate section in the F4Data sidebar, below the dashboards view. It lists regular files found directly in the currently selected dashboard's `Documents/` folder. Selecting another dashboard updates the list; clicking empty space in the dashboard list keeps showing the last selected dashboard's documents. Markdown files open in separate, locked VS Code preview tabs (reopening the same file reuses its preview). The preview supports collapsible sections (`+++ Summary` ... `+++`) and GitHub-style task lists (`- [ ]` / `- [x]`). Other files open with their associated system application. Subfolders and their contents are intentionally ignored. Create `Documents/` if it does not exist; its contents refresh automatically as files are added, changed, or removed.
 
 ## Generated dashboard projects
 
@@ -65,11 +67,41 @@ CSV/TSV/Parquet files are exposed to DuckDB as views named after the source (`"s
 
 For example, query a configured CSV view with `SELECT * FROM "sales"` or a table in the configured DuckDB file with `SELECT * FROM "warehouse".main.my_table`. Changing files in configured source directories invalidates the cache and refreshes the open dashboard.
 
+Optionally, add `expectedSchema` alongside fields such as `name` and `dataSources` in the dashboard's `package.json`. The **Diagnose Dashboard** command checks that the datasets and columns your dashboard depends on are still available:
+
+```json
+{
+  "name": "sales-dashboard",
+  "dataSources": [
+    { "name": "sales", "type": "csv", "path": "../exports/sales.csv" },
+    { "name": "warehouse", "type": "duckdb", "path": "../shared/warehouse.duckdb" }
+  ],
+  "expectedSchema": [
+    {
+      "dataset": "sales",
+      "columns": ["order_id", "customer_id", "amount"]
+    },
+    {
+      "dataset": "warehouse: customers",
+      "columns": ["customer_id", "name"]
+    }
+  ]
+}
+```
+
+`dataset` must match the name shown by the diagnostic: a configured CSV/TSV/Parquet source uses its source alias, while a DuckDB table uses `<source alias>: <table name>`. For example, `"warehouse: customers"` refers to the `customers` table in the `warehouse` DuckDB source. List only the columns the dashboard actually uses; this keeps the check focused on breaking changes rather than optional fields.
+
+`expectedSchema` is optional. If it is omitted, the command lists the discovered schema but does not compare it. If a data source cannot be inspected, its checks are reported as skipped instead of incorrectly saying that its datasets or columns are missing. The detailed report appears in the **F4Data Dashboard Diagnostics** output.
+
 Initial data is sampled into the Webview, and dashboard requests can execute DuckDB SQL against the data views. Query results are cached by SQL and data-file fingerprint; changing a file invalidates the cache. Each operation closes its DuckDB connection and instance.
 
 ## Optional local data copies
 
-The `f4datadashb.localCopy` setting is `off` by default, preserving the existing behavior. It applies to dashboards using the conventional `data/` directory; dashboards with a `dataSources` property continue to use those configured paths directly.
+The **Create Local Data Copy** dashboard context-menu action is available when the dashboard has data files. Choose a destination folder; the extension warns before using a network location. It copies only files directly selected by the dashboard: configured `dataSources` when that property exists, otherwise files directly inside `data/`. Nested folders are not copied. The copy location is stored in the current VS Code profile and takes priority over both `dataSources` and `data/` when opening the dashboard. The folder name is derived from the dashboard name and a path-specific suffix.
+
+The dashboard tree shows whether the local copy is up to date, the source has changed, or the copy has been edited. **Update Local Data Copy** replaces the copy after confirmation if it has local edits; **Delete Local Data Copy** removes it and returns the dashboard to its configured sources. If files are missing from the copy, opening the dashboard offers to recreate it, use the dashboard data, or cancel. The copy is not written to the dashboard or its shared `package.json`.
+
+The separate `f4datadashb.localCopy` setting is `off` by default, preserving the existing automatic-copy behavior. It applies only to dashboards using the conventional `data/` directory; dashboards with a `dataSources` property continue to use those configured paths directly.
 
 - `off`: always read from the original location.
 - `auto`: copy `data/` only when its path is detected on a network filesystem and the total size is at least `f4datadashb.localCopyThresholdMb` (default `50`).

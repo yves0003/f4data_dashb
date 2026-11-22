@@ -8,6 +8,7 @@ import { pipeline } from "node:stream/promises";
 import { promisify } from "node:util";
 import type * as vscode from "vscode";
 import { DuckDBInstance } from "@duckdb/node-api";
+import type { DataFile } from "./duckdbService";
 
 const execFile = promisify(execFileCallback);
 const STORAGE_FOLDER = "yves0003.f4datadashb";
@@ -36,6 +37,30 @@ export interface LocalCopyLease {
   readonly dataPath: string;
   dispose(): Promise<void>;
 }
+
+export interface UserDataCopyFile {
+  source: DataFile;
+  copyPath: string;
+  relativePath: string;
+  sourceSignature: string;
+  copySignature: string;
+  sourceHash: string;
+  copyHash: string;
+}
+
+export interface UserDataCopy {
+  selectedRoot: string;
+  targetRoot: string;
+  files: UserDataCopyFile[];
+}
+
+export interface UserDataCopyStatus {
+  sourceChanged: boolean;
+  copyChanged: boolean;
+  missingCopy: boolean;
+}
+
+const userCopyHashCache = new WeakMap<UserDataCopy, Map<string, { signature: string; hash: string }>>();
 
 export function readLocalCopyOptions(
   configuration: Pick<vscode.WorkspaceConfiguration, "get">
@@ -279,6 +304,156 @@ export class LocalCopyService {
     }
   }
 
+  async createUserCopy(
+    files: readonly DataFile[],
+    selectedRoot: string,
+    targetRoot: string,
+    progress: LocalCopyProgress,
+    token: vscode.CancellationToken
+  ): Promise<UserDataCopy | undefined> {
+    const resolvedSelectedRoot = path.resolve(selectedRoot);
+    const resolvedTargetRoot = path.resolve(targetRoot);
+    if (path.dirname(resolvedTargetRoot) !== resolvedSelectedRoot) {
+      throw new Error("The dashboard copy folder must be a direct child of the selected folder");
+    }
+    if (!fs.statSync(resolvedSelectedRoot).isDirectory()) {
+      throw new Error("The selected copy location is not a directory");
+    }
+    if (files.length === 0) {
+      throw new Error("There are no supported data files to copy");
+    }
+
+    const totalBytes = files.reduce((total, file) => total + fs.statSync(file.path).size, 0);
+    const diskStats = fs.statfsSync(resolvedSelectedRoot);
+    const availableBytes = Number(diskStats.bavail) * Number(diskStats.bsize);
+    const requiredBytes = Math.ceil(totalBytes * 1.2);
+    if (availableBytes < requiredBytes) {
+      throw new InsufficientCopySpaceError(requiredBytes, availableBytes);
+    }
+    const lockPath = acquireUserCopyLock(resolvedTargetRoot);
+    const stageRoot = `${resolvedTargetRoot}.partial-${randomUUID()}`;
+    const backupRoot = `${resolvedTargetRoot}.previous-${randomUUID()}`;
+    const abortController = new AbortController();
+    const cancellation = token.onCancellationRequested(() => abortController.abort());
+    const copiedFiles: UserDataCopyFile[] = [];
+    let completedBytes = 0;
+    let reportedPercent = 0;
+    try {
+      fs.mkdirSync(stageRoot, { recursive: false });
+      for (const [index, file] of files.entries()) {
+        if (token.isCancellationRequested) {
+          return undefined;
+        }
+        const source = captureSourceFile(file.path, userCopyRelativePath(file, index));
+        const sourceHash = hashFileSync(file.path);
+        const destination = path.join(stageRoot, source.relativePath);
+        fs.mkdirSync(path.dirname(destination), { recursive: true });
+        const extension = path.extname(file.path).toLowerCase();
+        let copyHash: string;
+        if (extension === ".duckdb" || extension === ".ddb") {
+          copyHash = await snapshotDuckDb(
+            file.path,
+            destination,
+            abortController.signal,
+            source.size,
+            (percent, rate) => {
+              const nextPercent = totalBytes === 0
+                ? 100
+                : Math.min(100, (completedBytes + source.size * percent / 100) / totalBytes * 100);
+              progress.report(
+                `Snapshotting ${path.basename(file.path)} (${Math.round(rate)} MB/s)`,
+                Math.max(0, nextPercent - reportedPercent)
+              );
+              reportedPercent = nextPercent;
+            }
+          );
+        } else {
+          copyHash = await copyFileAndHash(
+            file.path,
+            destination,
+            abortController.signal,
+            source.size,
+            (bytesCopied) => {
+              const nextPercent = totalBytes === 0
+                ? 100
+                : Math.min(100, (completedBytes + bytesCopied) / totalBytes * 100);
+              progress.report(
+                `Copying ${path.basename(file.path)}`,
+                Math.max(0, nextPercent - reportedPercent)
+              );
+              reportedPercent = nextPercent;
+            }
+          );
+        }
+        const sourceAfterCopy = fs.statSync(file.path);
+        if (!sameSourceVersion(sourceAfterCopy, source) ||
+          ((extension !== ".duckdb" && extension !== ".ddb") && copyHash !== sourceHash)) {
+          throw new Error(`Source changed while it was being copied: ${file.path}`);
+        }
+        const copyPath = path.join(resolvedTargetRoot, source.relativePath);
+        const copyStat = fs.statSync(destination);
+        copiedFiles.push({
+          source: { ...file, path: path.resolve(file.path) },
+          copyPath,
+          relativePath: source.relativePath,
+          sourceSignature: fileSignature(sourceAfterCopy),
+          copySignature: fileSignature(copyStat),
+          sourceHash,
+          copyHash
+        });
+        completedBytes += source.size;
+        const nextPercent = totalBytes === 0 ? 100 : completedBytes / totalBytes * 100;
+        progress.report(`Copied ${path.basename(file.path)}`, Math.max(0, nextPercent - reportedPercent));
+        reportedPercent = nextPercent;
+      }
+
+      if (token.isCancellationRequested) {
+        return undefined;
+      }
+      if (fs.existsSync(resolvedTargetRoot)) {
+        fs.renameSync(resolvedTargetRoot, backupRoot);
+      }
+      try {
+        fs.renameSync(stageRoot, resolvedTargetRoot);
+      } catch (error) {
+        if (fs.existsSync(backupRoot)) {
+          fs.renameSync(backupRoot, resolvedTargetRoot);
+        }
+        throw error;
+      }
+      if (fs.existsSync(backupRoot)) {
+        fs.rmSync(backupRoot, { recursive: true, force: true });
+      }
+      return {
+        selectedRoot: resolvedSelectedRoot,
+        targetRoot: resolvedTargetRoot,
+        files: copiedFiles
+      };
+    } finally {
+      cancellation.dispose();
+      if (fs.existsSync(stageRoot)) {
+        fs.rmSync(stageRoot, { recursive: true, force: true });
+      }
+      fs.rmSync(lockPath, { recursive: true, force: true });
+    }
+  }
+
+  deleteUserCopy(targetRoot: string, selectedRoot: string): void {
+    const resolvedTargetRoot = path.resolve(targetRoot);
+    const resolvedSelectedRoot = path.resolve(selectedRoot);
+    if (path.dirname(resolvedTargetRoot) !== resolvedSelectedRoot) {
+      throw new Error("Refusing to delete a dashboard copy outside its selected folder");
+    }
+    const stats = fs.statSync(resolvedSelectedRoot);
+    if (!stats.isDirectory() || !fs.existsSync(resolvedTargetRoot)) {
+      throw new Error("The configured dashboard copy does not exist");
+    }
+    if (path.basename(resolvedTargetRoot).includes(".partial-")) {
+      throw new Error("Refusing to delete an incomplete dashboard copy");
+    }
+    fs.rmSync(resolvedTargetRoot, { recursive: true, force: false });
+  }
+
   purge(keep: LocalCopyOptions["keep"]): number {
     if (!fs.existsSync(this.cacheRoot)) {
       return 0;
@@ -388,6 +563,134 @@ export class LocalCopyService {
       }
     };
   }
+}
+
+export function inspectUserDataCopy(
+  copy: UserDataCopy,
+  currentFiles: readonly DataFile[]
+): UserDataCopyStatus {
+  const expectedFiles = new Map(copy.files.map((file) => [path.resolve(file.source.path), file]));
+  const currentPaths = new Set(currentFiles.map((file) => path.resolve(file.path)));
+  let sourceChanged = currentFiles.length !== copy.files.length;
+  let copyChanged = false;
+  let missingCopy = false;
+
+  for (const currentFile of currentFiles) {
+    const sourcePath = path.resolve(currentFile.path);
+    const copied = expectedFiles.get(sourcePath);
+    if (!copied) {
+      sourceChanged = true;
+      continue;
+    }
+    try {
+      const sourceStat = fs.statSync(sourcePath);
+      if (!sourceStat.isFile()) {
+        sourceChanged = true;
+      } else if (
+        currentFile.name !== copied.source.name ||
+        currentFile.type !== copied.source.type ||
+        currentFile.alias !== copied.source.alias ||
+        (
+          fileSignature(sourceStat) !== copied.sourceSignature &&
+          getCachedUserCopyHash(copy, sourcePath, fileSignature(sourceStat)) !== copied.sourceHash
+        )
+      ) {
+        sourceChanged = true;
+      }
+    } catch {
+      sourceChanged = true;
+    }
+  }
+
+  for (const copied of copy.files) {
+    if (!currentPaths.has(path.resolve(copied.source.path))) {
+      sourceChanged = true;
+    }
+    try {
+      const copyStat = fs.statSync(copied.copyPath);
+      if (!copyStat.isFile()) {
+        missingCopy = true;
+      } else if (
+        fileSignature(copyStat) !== copied.copySignature &&
+        getCachedUserCopyHash(copy, copied.copyPath, fileSignature(copyStat)) !== copied.copyHash
+      ) {
+        copyChanged = true;
+      }
+    } catch {
+      missingCopy = true;
+    }
+  }
+  return { sourceChanged, copyChanged, missingCopy };
+}
+
+function getCachedUserCopyHash(copy: UserDataCopy, filePath: string, signature: string): string {
+  let hashes = userCopyHashCache.get(copy);
+  if (!hashes) {
+    hashes = new Map();
+    userCopyHashCache.set(copy, hashes);
+  }
+  const cached = hashes.get(filePath);
+  if (cached?.signature === signature) {
+    return cached.hash;
+  }
+  const hash = hashFileSync(filePath);
+  hashes.set(filePath, { signature, hash });
+  return hash;
+}
+
+export function sanitizeDirectoryName(value: string): string {
+  const normalized = value
+    .normalize("NFKC")
+    .replace(/[<>:"/\\|?*\u0000-\u001f]/g, "-")
+    .replace(/[. ]+$/g, "")
+    .replace(/\s+/g, "-")
+    .replace(/-+/g, "-")
+    .slice(0, 100);
+  return normalized && !/^(?:CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])$/i.test(normalized)
+    ? normalized
+    : "dashboard";
+}
+
+function acquireUserCopyLock(targetRoot: string): string {
+  const lockPath = `${targetRoot}.copy-lock`;
+  for (let attempt = 0; attempt < 2; attempt++) {
+    try {
+      fs.mkdirSync(lockPath);
+      try {
+        fs.writeFileSync(path.join(lockPath, "owner.json"), JSON.stringify({
+          pid: process.pid,
+          host: os.hostname()
+        } satisfies LockFile), { flag: "wx" });
+      } catch (error) {
+        fs.rmSync(lockPath, { recursive: true, force: true });
+        throw error;
+      }
+      return lockPath;
+    } catch (error) {
+      if (!isRecord(error) || error.code !== "EEXIST") {
+        throw error;
+      }
+      let owner: unknown;
+      try {
+        owner = JSON.parse(fs.readFileSync(path.join(lockPath, "owner.json"), "utf8"));
+      } catch {
+        throw new Error("A copy or update is already in progress for this dashboard");
+      }
+      if (
+        attempt === 0 &&
+        isRecord(owner) &&
+        owner.host === os.hostname() &&
+        typeof owner.pid === "number" &&
+        Number.isInteger(owner.pid) &&
+        !isProcessAlive(owner.pid)
+      ) {
+        fs.rmSync(lockPath, { recursive: true, force: true });
+        continue;
+      }
+      throw new Error("A copy or update is already in progress for this dashboard");
+    }
+  }
+  throw new Error("A copy or update is already in progress for this dashboard");
 }
 
 export function getLocalCacheRoot(
@@ -514,6 +817,41 @@ function scanFiles(root: string): SourceFile[] {
   };
   visit(root);
   return files.sort((left, right) => left.relativePath.localeCompare(right.relativePath));
+}
+
+function captureSourceFile(filePath: string, relativePath: string): SourceFile {
+  const stat = fs.statSync(filePath);
+  if (!stat.isFile()) {
+    throw new Error(`Data source is not a regular file: ${filePath}`);
+  }
+  return {
+    path: path.resolve(filePath),
+    relativePath,
+    size: stat.size,
+    mtimeMs: stat.mtimeMs,
+    ctimeMs: stat.ctimeMs,
+    birthtimeMs: stat.birthtimeMs,
+    dev: stat.dev,
+    ino: stat.ino
+  };
+}
+
+function userCopyRelativePath(file: DataFile, index: number): string {
+  const fileName = path.basename(file.path);
+  return file.alias
+    ? path.join("sources", `${sanitizeDirectoryName(file.alias)}-${index + 1}`, fileName)
+    : path.join("data", fileName);
+}
+
+function fileSignature(stat: fs.Stats): string {
+  return [
+    stat.dev,
+    stat.ino,
+    stat.size,
+    stat.mtimeMs,
+    stat.ctimeMs,
+    stat.birthtimeMs
+  ].join(":");
 }
 
 function getSourceFingerprint(files: SourceFile[]): string {

@@ -2,30 +2,47 @@
 
 ## Unreleased
 
+### Dashboard list activation
+
+- Refresh the dashboard list whenever its view becomes visible, so dashboards are reloaded when the user returns to the extension after VS Code startup.
+- Coalesce concurrent refresh requests to prevent overlapping reads and state updates.
+- Register the dashboard-open command before creating the tree view, so a newly displayed dashboard cannot be clicked before its command handler exists.
+- Keep stored paths for dashboards that cannot currently be accessed, preserve their favorites, and retry loading them every 10 seconds until they are available or the extension is deactivated.
+- Remove stored entries only when the dashboard is accessible but structurally invalid.
+- Show loading, empty, load-error, and temporarily-unavailable states in the dashboard view, with retry actions where applicable.
+- Add activation, first-visibility refresh, and rapid repeated-open regression tests.
+- Add an optional `expectedSchema` manifest property and a dashboard diagnostic command that reports available datasets/columns and missing expected schema elements.
+
 ### Dashboard tabs
 
 - Reuse and reveal the existing dashboard Webview when its tree item is clicked again, including while its first opening is still in progress.
 - Pass the stable dashboard path to the row-open command instead of the transient TreeItem object, avoiding stale command arguments during repeated clicks and tree refreshes.
 - Show the extension logo on dashboard tabs.
 - Added a gear action in the dashboard view title to open this extension's settings.
-- Dashboard list items use the `screen-full` icon and switch to `screen-normal` while selected.
+- Dashboard list items use `screen-full`; favorited dashboards use a star in the main list.
 
 ### Dashboard documents
 
-- Added a separate Documents view below the dashboards view in the F4Data sidebar, grouping direct files in each dashboard's `Documents/` directory.
-- Opening a file uses VS Code's default editor. Nested directories are not traversed or listed.
-- Changes to the `Documents/` folder and its direct files refresh the view automatically.
-- Tests verify direct-file listing and exclusion of nested files and non-directory paths.
+- Added a separate Documents view below the dashboards view in the F4Data sidebar, listing direct files only for the currently selected dashboard.
+- Markdown files open in VS Code's Markdown Preview; other documents open in their associated system application. Nested directories are not traversed or listed.
+- Markdown previews are locked so different files remain open in separate tabs; reopening the same file reuses its preview.
+- Selecting another dashboard updates the Documents view; clearing the tree selection by clicking empty space retains the last selected dashboard's documents.
+- Changes to the selected dashboard's `Documents/` folder and its direct files refresh the view automatically.
+- Tests verify selected-dashboard switching, direct-file listing, and exclusion of nested files and non-directory paths.
 
 ### Dashboard favorites
 
 - Added a separate Favorites view backed by VS Code `globalState`; toggling the star on a dashboard adds or removes it from Favorites.
-- The main dashboard list keeps `screen-full` and `screen-normal` for its selection state. Favorites rows use `screen-full` and switch to `screen-normal` when selected.
+- The main dashboard list uses a star for favorited dashboards and `screen-full` for other dashboards. Favorites rows use `screen-full`.
 - Removing a dashboard from the imported list also removes it from Favorites.
 
 ### Generated dashboard guide
 
 - Expanded newly generated `SKILL_GUIDE.md` files with guidance on validating SQL table/column names, handling dropped or changed schema, displaying request errors, limiting or paging large results, cancelling stale queries, and recovering after source changes.
+
+### Markdown preview
+
+- Extended VS Code's built-in Markdown Preview with collapsible sections and GitHub-style task lists.
 
 ### Optional local data copies
 

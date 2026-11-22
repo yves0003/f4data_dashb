@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import * as vscode from "vscode";
@@ -5,17 +6,26 @@ import { DashboardInfo, findDashboards, normalizePath, readDashboard } from "./d
 import {
   DashboardFavoritesTreeProvider,
   DashboardDocumentsTreeProvider,
+  DashboardCopyState,
   DashboardTreeItem,
   DashboardTreeProvider
 } from "./dashboardTree";
 import { DashboardWebviewManager } from "./dashboardWebview";
-import { DuckDbService } from "./duckdbService";
+import { DataFile, DataFilesOverride, DuckDbService, resolveDashboardDataFiles } from "./duckdbService";
 import { translate } from "./i18n";
-import { LocalCopyService, readLocalCopyOptions } from "./localCopyService";
+import { extendMarkdownIt } from "./markdownPlugins";
+import {
+  inspectUserDataCopy,
+  isNetworkPath,
+  LocalCopyService,
+  readLocalCopyOptions,
+  sanitizeDirectoryName,
+  UserDataCopy
+} from "./localCopyService";
 
 let activeDuckDbService: DuckDbService | undefined;
 
-export function activate(context: vscode.ExtensionContext): void {
+export function activate(context: vscode.ExtensionContext): { extendMarkdownIt: typeof extendMarkdownIt } {
   const language = vscode.env.language;
   const t = (key: Parameters<typeof translate>[1], ...values: string[]) => translate(language, key, ...values);
   const tree = new DashboardTreeProvider(context.globalState, language);
@@ -23,35 +33,556 @@ export function activate(context: vscode.ExtensionContext): void {
   activeDuckDbService = duckDb;
   const localCopies = new LocalCopyService();
   const webviews = new DashboardWebviewManager(context, duckDb, language, localCopies);
+  const diagnosticsOutput = vscode.window.createOutputChannel(t("diagnosticsTitle"));
+  context.subscriptions.push(diagnosticsOutput);
+  const readUserCopies = (): Record<string, UserDataCopy> =>
+    context.globalState.get<Record<string, UserDataCopy>>("userDashboardDataCopies", {});
+  let documentsTree: DashboardDocumentsTreeProvider | undefined;
+  const copyKey = (dashboardPath: string): string => path.resolve(dashboardPath);
+  const saveUserCopy = async (dashboardPath: string, copy: UserDataCopy | undefined): Promise<void> => {
+    const copies = readUserCopies();
+    const key = copyKey(dashboardPath);
+    if (copy) {
+      copies[key] = copy;
+    } else {
+      delete copies[key];
+    }
+    await context.globalState.update("userDashboardDataCopies", copies);
+  };
+  let copyStatusWatchers: vscode.FileSystemWatcher[] = [];
+  let copyStatusSubscriptions: vscode.Disposable[] = [];
+  let copyStatusTimer: NodeJS.Timeout | undefined;
+  const runUserDataCopy = async (
+    files: readonly DataFile[],
+    selectedRoot: string,
+    targetRoot: string
+  ): Promise<UserDataCopy | undefined> => vscode.window.withProgress({
+    location: vscode.ProgressLocation.Notification,
+    title: t("preparingLocalCopy"),
+    cancellable: true
+  }, (progress, token) => localCopies.createUserCopy(
+    files,
+    selectedRoot,
+    targetRoot,
+    {
+      report: (message, increment) => progress.report({ message, increment })
+    },
+    token
+  ));
+  const getDashboardCopyState = async (dashboard: DashboardInfo): Promise<DashboardCopyState> => {
+    const withSessionState = (state: DashboardCopyState): DashboardCopyState => ({
+      ...state,
+      hasDatabaseSession: duckDb.hasDashboardSession(dashboard.path)
+    });
+    const configuredCopy = readUserCopies()[copyKey(dashboard.path)];
+    let files: DataFile[];
+    try {
+      files = resolveDashboardDataFiles(dashboard.path);
+    } catch {
+      return withSessionState(configuredCopy
+        ? {
+          hasData: true,
+          hasCopy: true,
+          label: t("localDataCopyUnavailable"),
+          tooltip: t("localDataCopyUnavailable")
+        }
+        : { hasData: false, hasCopy: false });
+    }
+    if (!configuredCopy) {
+      if (files.length === 0) {
+        return withSessionState({ hasData: false, hasCopy: false });
+      }
+      try {
+        const sourceDirectories = [...new Set(files.map((file) => path.dirname(file.path)))];
+        const networkSources = await Promise.all(sourceDirectories.map((directory) => isNetworkPath(directory)));
+        return withSessionState({ hasData: networkSources.some(Boolean), hasCopy: false });
+      } catch {
+        return withSessionState({ hasData: true, hasCopy: false });
+      }
+    }
+    let status: ReturnType<typeof inspectUserDataCopy>;
+    try {
+      status = inspectUserDataCopy(configuredCopy, files);
+    } catch {
+      return withSessionState({
+        hasData: true,
+        hasCopy: true,
+        label: t("localDataCopyUnavailable"),
+        tooltip: configuredCopy.targetRoot
+      });
+    }
+    const statusKey = status.missingCopy
+      ? "localDataCopyMissing"
+      : status.sourceChanged && status.copyChanged
+        ? "localDataCopyBothChanged"
+        : status.sourceChanged
+          ? "localDataCopySourceChanged"
+          : status.copyChanged
+            ? "localDataCopyEdited"
+            : "localDataCopyUpToDate";
+    return withSessionState({
+      hasData: true,
+      hasCopy: true,
+      label: t(statusKey),
+      tooltip: `${t(statusKey)}\n${configuredCopy.targetRoot}`
+    });
+  };
+  const refreshCopyIndicators = async (): Promise<void> => {
+    const items = tree.getChildren().filter((item): item is DashboardTreeItem => item instanceof DashboardTreeItem);
+    const sourceDirectories = new Set<string>();
+    for (const item of items) {
+      tree.setCopyState(item.dashboard.path, await getDashboardCopyState(item.dashboard));
+      try {
+        for (const file of resolveDashboardDataFiles(item.dashboard.path)) {
+          sourceDirectories.add(path.dirname(file.path));
+        }
+      } catch {
+        // The configured local copy may still be usable while its source is offline.
+      }
+      const copy = readUserCopies()[copyKey(item.dashboard.path)];
+      for (const file of copy?.files ?? []) {
+        sourceDirectories.add(path.dirname(file.copyPath));
+      }
+    }
+    for (const subscription of copyStatusSubscriptions) {
+      subscription.dispose();
+    }
+    for (const watcher of copyStatusWatchers) {
+      watcher.dispose();
+    }
+    copyStatusSubscriptions = [];
+    copyStatusWatchers = [...sourceDirectories].map((directory) =>
+      vscode.workspace.createFileSystemWatcher(new vscode.RelativePattern(vscode.Uri.file(directory), "*"))
+    );
+    const scheduleCopyStatusRefresh = (): void => {
+      if (copyStatusTimer) {
+        clearTimeout(copyStatusTimer);
+      }
+      copyStatusTimer = setTimeout(() => {
+        copyStatusTimer = undefined;
+        void refreshCopyIndicators().catch((error: unknown) => {
+          void vscode.window.showErrorMessage(t("localCopyUpdateFailed", errorMessage(error)));
+        });
+      }, 500);
+    };
+    copyStatusSubscriptions = copyStatusWatchers.flatMap((watcher) => [
+      watcher.onDidCreate(scheduleCopyStatusRefresh),
+      watcher.onDidChange(scheduleCopyStatusRefresh),
+      watcher.onDidDelete(scheduleCopyStatusRefresh)
+    ]);
+  };
+  const refreshDashboardTree = async () => {
+    const result = await tree.refresh();
+    await refreshCopyIndicators();
+    return result;
+  };
+  context.subscriptions.push(duckDb.onDidChangeSessions(() => {
+    void refreshCopyIndicators().catch((error: unknown) => {
+      void vscode.window.showErrorMessage(t("importFailed", errorMessage(error)));
+    });
+  }));
+  context.subscriptions.push({
+    dispose: () => {
+      if (copyStatusTimer) {
+        clearTimeout(copyStatusTimer);
+      }
+      for (const subscription of copyStatusSubscriptions) {
+        subscription.dispose();
+      }
+      for (const watcher of copyStatusWatchers) {
+        watcher.dispose();
+      }
+    }
+  });
+  const openDashboard = async (argument?: unknown): Promise<void> => {
+      const dashboardPath = getDashboardPathArgument(argument);
+      if (!dashboardPath) {
+        return;
+      }
+      documentsTree?.setSelectedDashboard(dashboardPath);
+      let dashboardName = path.basename(dashboardPath);
+      try {
+        const current = readDashboard(dashboardPath);
+        dashboardName = current.displayName;
+        const configuredCopy = readUserCopies()[copyKey(current.path)];
+        let dataOverride: DataFilesOverride | undefined;
+        let skipAutomaticCopy = false;
+        if (configuredCopy) {
+          let sourceFiles: DataFile[] | undefined;
+          try {
+            sourceFiles = resolveDashboardDataFiles(current.path);
+          } catch {
+            sourceFiles = undefined;
+          }
+          const copyStatus = inspectUserDataCopy(configuredCopy, sourceFiles ?? []);
+          if (copyStatus.missingCopy) {
+            const recreate = t("recreateLocalCopy");
+            const useSource = t("useDashboardData");
+            const action = await vscode.window.showWarningMessage(
+              t("localCopyMissingQuestion", current.displayName),
+              recreate,
+              useSource
+            );
+            if (action === recreate) {
+              if (!sourceFiles?.length) {
+                void vscode.window.showErrorMessage(t("localCopyPathMissing"));
+                return;
+              }
+              try {
+                if (path.resolve(configuredCopy.targetRoot) !==
+                  dashboardCopyTarget(current, configuredCopy.selectedRoot)) {
+                  throw new Error(t("localCopyPathMissing"));
+                }
+                const replacement = await runUserDataCopy(
+                  sourceFiles,
+                  configuredCopy.selectedRoot,
+                  configuredCopy.targetRoot
+                );
+                if (!replacement) {
+                  return;
+                }
+                await saveUserCopy(current.path, replacement);
+                dataOverride = dataFilesOverride(replacement);
+              } catch (copyError) {
+                void vscode.window.showErrorMessage(t("localCopyUpdateFailed", errorMessage(copyError)));
+                return;
+              }
+            } else if (action === useSource) {
+              skipAutomaticCopy = true;
+            } else {
+              return;
+            }
+          } else {
+            dataOverride = dataFilesOverride(configuredCopy);
+          }
+        }
+        await webviews.open(current.path, current.displayName, dataOverride, skipAutomaticCopy);
+      } catch (error) {
+        const reason = error instanceof Error && error.message.startsWith("invalid-package:")
+          ? t("invalidPackage", error.message.slice("invalid-package:".length))
+          : error instanceof Error && error.message === "invalid-dashboard"
+            ? t("invalidDashboard")
+            : errorMessage(error);
+        void vscode.window.showErrorMessage(t("openFailed", dashboardName, reason));
+      }
+  };
+  context.subscriptions.push(
+    vscode.commands.registerCommand("f4datadashb.openDashboard", openDashboard),
+    vscode.commands.registerCommand("f4datadashb.openDashboardDocument", async (documentPath?: unknown) => {
+      if (typeof documentPath !== "string" || !documentPath.trim()) {
+        return;
+      }
+      try {
+        const documentUri = vscode.Uri.file(documentPath);
+        if (path.extname(documentPath).toLowerCase() === ".md") {
+          await vscode.commands.executeCommand(
+            "markdown.showPreview",
+            documentUri,
+            undefined,
+            { locked: true }
+          );
+        } else if (!await vscode.env.openExternal(documentUri)) {
+          throw new Error(t("openDocumentFailed", documentPath));
+        }
+      } catch (error) {
+        void vscode.window.showErrorMessage(t("openDocumentFailed", errorMessage(error)));
+      }
+    })
+  );
+  context.subscriptions.push(vscode.commands.registerCommand(
+    "f4datadashb.refreshDashboards",
+    async () => {
+      try {
+        await refreshDashboardTree();
+      } catch (error) {
+        void vscode.window.showErrorMessage(t("importFailed", errorMessage(error)));
+      }
+    }
+  ));
+  context.subscriptions.push(vscode.commands.registerCommand(
+    "f4datadashb.diagnoseDashboard",
+    async () => {
+      try {
+        await refreshDashboardTree();
+      } catch (error) {
+        void vscode.window.showErrorMessage(t("importFailed", errorMessage(error)));
+        return;
+      }
+      const dashboards = tree.getChildren()
+        .filter((item): item is DashboardTreeItem => item instanceof DashboardTreeItem);
+      if (dashboards.length === 0) {
+        void vscode.window.showInformationMessage(t("noDashboardsToDiagnose"));
+        return;
+      }
+      const selected = await vscode.window.showQuickPick(
+        dashboards.map((item) => ({
+          label: item.dashboard.displayName,
+          description: item.dashboard.path,
+          dashboard: item.dashboard
+        })),
+        { placeHolder: t("chooseDiagnosticDashboard") }
+      );
+      if (!selected) {
+        return;
+      }
+      try {
+        const result = await duckDb.diagnoseSchema(selected.dashboard.path);
+        diagnosticsOutput.clear();
+        diagnosticsOutput.appendLine(`${t("diagnosticsTitle")}: ${selected.dashboard.displayName}`);
+        diagnosticsOutput.appendLine(t("diagnosticsFiles", result.files.join(", ") || "—"));
+        diagnosticsOutput.appendLine("");
+        diagnosticsOutput.appendLine(t("diagnosticsAvailableSchema"));
+        if (result.datasets.length === 0) {
+          diagnosticsOutput.appendLine(`  ${t("diagnosticsNoDatasets")}`);
+        }
+        for (const dataset of result.datasets) {
+          const schema = dataset.error
+            ? `${dataset.name}: ${dataset.error}`
+            : `${dataset.name}: ${dataset.columns.join(", ") || "—"}`;
+          diagnosticsOutput.appendLine(`  ${schema}`);
+        }
+        diagnosticsOutput.appendLine("");
+
+        const issueCount = result.datasets.filter((dataset) => dataset.error).length
+          + result.checks.filter((check) =>
+            check.status === "missing-dataset" || check.status === "missing-columns"
+          ).length;
+        if (!result.configured) {
+          diagnosticsOutput.appendLine(t("diagnosticsNoExpectedSchema"));
+        } else {
+          diagnosticsOutput.appendLine(t("diagnosticsExpectedSchema"));
+          for (const check of result.checks) {
+            if (check.status === "valid") {
+              diagnosticsOutput.appendLine(`  ${t("diagnosticsValid", check.dataset)}`);
+            } else if (check.status === "missing-dataset") {
+              diagnosticsOutput.appendLine(
+                `  ${t("diagnosticsMissingDataset", check.dataset)} ${t("diagnosticsMissingDatasetAdvice")}`
+              );
+            } else if (check.status === "missing-columns") {
+              diagnosticsOutput.appendLine(
+                `  ${t("diagnosticsMissingColumns", check.dataset, check.missingColumns.join(", "))}`
+              );
+              diagnosticsOutput.appendLine(`    ${t("diagnosticsMissingColumnsAdvice")}`);
+            } else if (check.status === "unavailable") {
+              diagnosticsOutput.appendLine(
+                `  ${t("diagnosticsUnavailable", check.dataset, diagnosticError(t, check.error))}`
+              );
+            } else {
+              diagnosticsOutput.appendLine(
+                `  ${t("diagnosticsSkipped", check.dataset, diagnosticError(t, check.error))}`
+              );
+            }
+          }
+        }
+        diagnosticsOutput.show(true);
+        if (issueCount > 0) {
+          void vscode.window.showWarningMessage(t("diagnosticsIssues", String(issueCount)));
+        } else if (!result.configured) {
+          void vscode.window.showInformationMessage(t("diagnosticsNoExpectedSchema"));
+        } else {
+          void vscode.window.showInformationMessage(t("diagnosticsPassed"));
+        }
+      } catch (error) {
+        diagnosticsOutput.clear();
+        diagnosticsOutput.appendLine(`${t("diagnosticsTitle")}: ${selected.dashboard.displayName}`);
+        diagnosticsOutput.appendLine(errorMessage(error));
+        diagnosticsOutput.show(true);
+        void vscode.window.showErrorMessage(t("importFailed", errorMessage(error)));
+      }
+    }
+  ));
+  context.subscriptions.push(vscode.commands.registerCommand(
+    "f4datadashb.copyDashboardData",
+    async (item?: DashboardTreeItem) => {
+      const dashboard = item?.dashboard;
+      if (!dashboard) {
+        return;
+      }
+      try {
+        const files = resolveDashboardDataFiles(dashboard.path);
+        if (files.length === 0) {
+          return;
+        }
+        const locations = await vscode.window.showOpenDialog({
+          canSelectFiles: false,
+          canSelectFolders: true,
+          canSelectMany: false,
+          openLabel: t("chooseLocalCopyFolder"),
+          title: t("chooseLocalCopyFolder")
+        });
+        if (!locations?.length) {
+          return;
+        }
+        let networkDestination = false;
+        try {
+          networkDestination = await isNetworkPath(locations[0].fsPath);
+        } catch {
+          const continueAction = t("continueCopy");
+          const action = await vscode.window.showWarningMessage(
+            t("localDataCopyNetworkWarning"),
+            continueAction,
+            t("cancel")
+          );
+          if (action !== continueAction) {
+            return;
+          }
+        }
+        if (networkDestination) {
+          const continueAction = t("continueCopy");
+          const action = await vscode.window.showWarningMessage(
+            t("localDataCopyNetworkWarning"),
+            continueAction,
+            t("cancel")
+          );
+          if (action !== continueAction) {
+            return;
+          }
+        }
+
+        const targetRoot = dashboardCopyTarget(dashboard, locations[0].fsPath);
+        const configuredCopy = readUserCopies()[copyKey(dashboard.path)];
+        if (fs.existsSync(targetRoot) && configuredCopy?.targetRoot !== path.resolve(targetRoot)) {
+          const replaceAction = t("replaceFile");
+          const action = await vscode.window.showWarningMessage(
+            t("localCopyExistingTarget"),
+            { modal: true },
+            replaceAction,
+            t("cancel")
+          );
+          if (action !== replaceAction) {
+            return;
+          }
+        }
+
+        const copy = await runUserDataCopy(files, locations[0].fsPath, targetRoot);
+        if (!copy) {
+          void vscode.window.showInformationMessage(t("copyCancelled"));
+          return;
+        }
+        await saveUserCopy(dashboard.path, copy);
+        await webviews.updateDataCopy(dashboard.path, dataFilesOverride(copy));
+        await refreshDashboardTree();
+        void vscode.window.showInformationMessage(t(
+          configuredCopy ? "localCopyUpdated" : "localCopyCreated",
+          dashboard.displayName
+        ));
+      } catch (error) {
+        void vscode.window.showErrorMessage(t("localCopyUpdateFailed", errorMessage(error)));
+      }
+    }
+  ));
+  context.subscriptions.push(vscode.commands.registerCommand(
+    "f4datadashb.updateDashboardDataCopy",
+    async (item?: DashboardTreeItem) => {
+      const dashboard = item?.dashboard;
+      const configuredCopy = dashboard ? readUserCopies()[copyKey(dashboard.path)] : undefined;
+      if (!dashboard || !configuredCopy) {
+        return;
+      }
+      try {
+        if (path.resolve(configuredCopy.targetRoot) !==
+          dashboardCopyTarget(dashboard, configuredCopy.selectedRoot)) {
+          throw new Error(t("localCopyPathMissing"));
+        }
+        const files = resolveDashboardDataFiles(dashboard.path);
+        if (files.length === 0) {
+          void vscode.window.showErrorMessage(t("localCopyPathMissing"));
+          return;
+        }
+        const status = inspectUserDataCopy(configuredCopy, files);
+        if (status.copyChanged) {
+          const continueAction = t("continueCopy");
+          const action = await vscode.window.showWarningMessage(
+            t("localCopyOverwriteEdited"),
+            { modal: true },
+            continueAction,
+            t("cancel")
+          );
+          if (action !== continueAction) {
+            return;
+          }
+        }
+        const copy = await runUserDataCopy(
+          files,
+          configuredCopy.selectedRoot,
+          configuredCopy.targetRoot
+        );
+        if (!copy) {
+          void vscode.window.showInformationMessage(t("copyCancelled"));
+          return;
+        }
+        await saveUserCopy(dashboard.path, copy);
+        await webviews.updateDataCopy(dashboard.path, dataFilesOverride(copy));
+        await refreshDashboardTree();
+        void vscode.window.showInformationMessage(t("localCopyUpdated", dashboard.displayName));
+      } catch (error) {
+        void vscode.window.showErrorMessage(t("localCopyUpdateFailed", errorMessage(error)));
+      }
+    }
+  ));
+  context.subscriptions.push(vscode.commands.registerCommand(
+    "f4datadashb.removeDashboardDataCopy",
+    async (item?: DashboardTreeItem) => {
+      const dashboard = item?.dashboard;
+      const configuredCopy = dashboard ? readUserCopies()[copyKey(dashboard.path)] : undefined;
+      if (!dashboard || !configuredCopy) {
+        return;
+      }
+      const removeAction = t("removeAction");
+      const action = await vscode.window.showWarningMessage(
+        t("removeCopyConfirmation", dashboard.displayName),
+        { modal: true },
+        removeAction,
+        t("cancel")
+      );
+      if (action !== removeAction) {
+        return;
+      }
+      try {
+        if (path.resolve(configuredCopy.targetRoot) !==
+          dashboardCopyTarget(dashboard, configuredCopy.selectedRoot)) {
+          throw new Error(t("localCopyPathMissing"));
+        }
+        await webviews.updateDataCopy(dashboard.path, undefined, true);
+        if (fs.existsSync(configuredCopy.targetRoot)) {
+          localCopies.deleteUserCopy(configuredCopy.targetRoot, configuredCopy.selectedRoot);
+        }
+        await saveUserCopy(dashboard.path, undefined);
+        await refreshDashboardTree();
+        void vscode.window.showInformationMessage(t("localCopyDeleted", dashboard.displayName));
+      } catch (error) {
+        void vscode.window.showErrorMessage(t("localCopyUpdateFailed", errorMessage(error)));
+      }
+    }
+  ));
   const treeView = vscode.window.createTreeView("f4datadashb.dashboards", { treeDataProvider: tree });
+  context.subscriptions.push(treeView.onDidChangeVisibility(({ visible }) => {
+    if (visible) {
+      void refreshDashboardTree().catch((error: unknown) => {
+        void vscode.window.showErrorMessage(t("importFailed", errorMessage(error)));
+      });
+    }
+  }));
   const favoritesTree = new DashboardFavoritesTreeProvider(tree, language);
   const favoritesView = vscode.window.createTreeView("f4datadashb.favorites", {
     treeDataProvider: favoritesTree
   });
-  context.subscriptions.push(
-    favoritesView.onDidChangeSelection(({ selection }) => {
-      const selected = selection[0];
-      favoritesTree.setSelectedDashboard(selected?.dashboard.path);
-    }),
-    treeView.onDidChangeSelection(({ selection }) => {
-      const selected = selection[0];
-      if (selected instanceof DashboardTreeItem) {
-        tree.setSelectedDashboard(selected.dashboard.path);
-        favoritesTree.setSelectedDashboard(selected.dashboard.path);
-      } else {
-        tree.setSelectedDashboard(undefined);
-        favoritesTree.setSelectedDashboard(undefined);
-      }
-    })
-  );
-  const documentsTree = new DashboardDocumentsTreeProvider(
-    context.globalState,
-    language,
-    tree.onDidChangeTreeData
-  );
+  documentsTree = new DashboardDocumentsTreeProvider(language, tree.onDidChangeTreeData);
   const documentsView = vscode.window.createTreeView("f4datadashb.documents", {
     treeDataProvider: documentsTree
   });
+  const initialDashboardSelection = treeView.selection?.[0];
+  if (initialDashboardSelection instanceof DashboardTreeItem) {
+    documentsTree.setSelectedDashboard(initialDashboardSelection.dashboard.path);
+  }
+  context.subscriptions.push(
+    treeView.onDidChangeSelection(({ selection }) => {
+      const selected = selection[0];
+      if (selected instanceof DashboardTreeItem) {
+        documentsTree.setSelectedDashboard(selected.dashboard.path);
+      }
+    })
+  );
   context.subscriptions.push(
     treeView,
     tree,
@@ -70,9 +601,14 @@ export function activate(context: vscode.ExtensionContext): void {
     void vscode.window.showErrorMessage(t("localCopyFailed", errorMessage(error)));
   }
 
-  void tree.refresh().then((invalidCount) => {
-    if (invalidCount > 0) {
-      void vscode.window.showWarningMessage(t("invalidStoredDashboards", String(invalidCount)));
+  void refreshDashboardTree().then((result) => {
+    if (result.invalidCount > 0) {
+      void vscode.window.showWarningMessage(t("invalidStoredDashboards", String(result.invalidCount)));
+    }
+    if (result.unavailableCount > 0) {
+      void vscode.window.showWarningMessage(
+        t("unavailableStoredDashboards", String(result.unavailableCount))
+      );
     }
   }).catch((error: unknown) => {
     void vscode.window.showErrorMessage(t("importFailed", errorMessage(error)));
@@ -97,6 +633,7 @@ export function activate(context: vscode.ExtensionContext): void {
           return;
         }
         const added = await tree.add(candidates);
+        await refreshCopyIndicators();
         if (added === 0) {
           if (candidates.length === 1) {
             void vscode.window.showWarningMessage(t("dashboardAlreadyImported"));
@@ -129,6 +666,7 @@ export function activate(context: vscode.ExtensionContext): void {
           return;
         }
         await initializeDashboard(locations[0].fsPath, displayName, language, framework, tree, t);
+        await refreshCopyIndicators();
       } catch (error) {
         void vscode.window.showErrorMessage(t("createFailed", errorMessage(error)));
       }
@@ -148,6 +686,7 @@ export function activate(context: vscode.ExtensionContext): void {
           return;
         }
         await initializeDashboard(resource.fsPath, displayName, language, framework, tree, t);
+        await refreshCopyIndicators();
       } catch (error) {
         void vscode.window.showErrorMessage(t("createFailed", errorMessage(error)));
       }
@@ -168,6 +707,7 @@ export function activate(context: vscode.ExtensionContext): void {
       }
       try {
         await tree.remove(dashboard.path);
+        await refreshCopyIndicators();
         void vscode.window.showInformationMessage(t("dashboardRemoved", dashboard.displayName));
       } catch (error) {
         void vscode.window.showErrorMessage(t("removeFailed", errorMessage(error)));
@@ -219,27 +759,9 @@ export function activate(context: vscode.ExtensionContext): void {
         "workbench.action.openSettings",
         "@ext:yves0003.f4datadashb"
       );
-    }),
-    vscode.commands.registerCommand("f4datadashb.openDashboard", async (argument?: unknown) => {
-      const dashboardPath = getDashboardPathArgument(argument);
-      if (!dashboardPath) {
-        return;
-      }
-      let dashboardName = path.basename(dashboardPath);
-      try {
-        const current = readDashboard(dashboardPath);
-        dashboardName = current.displayName;
-        await webviews.open(current.path, current.displayName);
-      } catch (error) {
-        const reason = error instanceof Error && error.message.startsWith("invalid-package:")
-          ? t("invalidPackage", error.message.slice("invalid-package:".length))
-          : error instanceof Error && error.message === "invalid-dashboard"
-            ? t("invalidDashboard")
-            : errorMessage(error);
-        void vscode.window.showErrorMessage(t("openFailed", dashboardName, reason));
-      }
     })
   );
+  return { extendMarkdownIt };
 }
 
 export async function deactivate(): Promise<void> {
@@ -856,6 +1378,23 @@ Les chemins relatifs sont résolus depuis la racine du dashboard. Dès que la pr
 
 Les noms SQL dépendent de la configuration : les fichiers CSV/TSV/Parquet sont exposés comme vues portant le nom de la source, et les bases DuckDB sont attachées sous leur alias. Vérifiez le nom réel des tables et colonnes avant de construire une requête. Dans une base DuckDB, vous pouvez inspecter les tables avec \`SHOW ALL TABLES\`; les colonnes d’une table se vérifient avec \`DESCRIBE SELECT * FROM "warehouse".main."ma_table"\`.
 
+La propriété facultative \`expectedSchema\` de \`package.json\` permet à la commande **Diagnostiquer le tableau de bord** de détecter les changements qui casseraient les requêtes. Déclarez uniquement les jeux de données et colonnes réellement utilisés :
+
+\`\`\`json
+{
+  "dataSources": [
+    { "name": "sales", "type": "csv", "path": "../exports/sales.csv" },
+    { "name": "warehouse", "type": "duckdb", "path": "../shared/warehouse.duckdb" }
+  ],
+  "expectedSchema": [
+    { "dataset": "sales", "columns": ["order_id", "customer_id", "amount"] },
+    { "dataset": "warehouse: customers", "columns": ["customer_id", "name"] }
+  ]
+}
+\`\`\`
+
+\`dataset\` doit correspondre au nom affiché par le diagnostic : une vue CSV/TSV/Parquet utilise l’alias de source; une table DuckDB utilise \`<alias de source>: <nom de table>\`. Par exemple, \`warehouse: customers\` désigne la table \`customers\` de la source DuckDB \`warehouse\`. Sans \`expectedSchema\`, le diagnostic liste les schémas découverts sans les comparer. Si une source ne peut pas être inspectée, ses vérifications sont ignorées, et non signalées comme des éléments manquants.
+
 ## Démarrage
 
 ${workflowGuide}
@@ -897,6 +1436,28 @@ function escapeHtml(value: string): string {
 
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
+}
+
+function dashboardCopyTarget(dashboard: DashboardInfo, selectedRoot: string): string {
+  const suffix = createHash("sha256")
+    .update(path.resolve(dashboard.path))
+    .digest("hex")
+    .slice(0, 8);
+  return path.resolve(selectedRoot, `${sanitizeDirectoryName(dashboard.displayName)}-${suffix}`);
+}
+
+function dataFilesOverride(copy: UserDataCopy): DataFilesOverride {
+  return {
+    rootPath: copy.targetRoot,
+    files: copy.files.map(({ source, copyPath }) => ({
+      ...source,
+      path: copyPath
+    }))
+  };
+}
+
+function diagnosticError(t: Translator, error: string | undefined): string {
+  return error === "no-data-files" ? t("diagnosticsNoDataFiles") : error ?? "";
 }
 
 function getDashboardPathArgument(argument: unknown): string | undefined {

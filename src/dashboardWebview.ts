@@ -4,6 +4,7 @@ import * as path from "node:path";
 import * as vscode from "vscode";
 import {
   DuckDbRuntimeOptions,
+  DataFilesOverride,
   DuckDbService,
   InitialData,
   isRelevantDataChange
@@ -19,6 +20,10 @@ import {
 export class DashboardWebviewManager {
   private readonly panels = new Map<string, vscode.WebviewPanel>();
   private readonly openingPanels = new Map<string, Promise<void>>();
+  private readonly dataOverrideUpdaters = new Map<
+    string,
+    (override: DataFilesOverride | undefined) => Promise<void>
+  >();
 
   constructor(
     private readonly context: vscode.ExtensionContext,
@@ -27,10 +32,18 @@ export class DashboardWebviewManager {
     private readonly localCopies: LocalCopyService
   ) {}
 
-  async open(dashboardPath: string, title: string): Promise<void> {
+  async open(
+    dashboardPath: string,
+    title: string,
+    dataFilesOverride?: DataFilesOverride,
+    skipAutomaticCopy = false
+  ): Promise<void> {
     const resolvedPath = path.resolve(dashboardPath);
     const existingPanel = this.panels.get(resolvedPath);
     if (existingPanel) {
+      if (dataFilesOverride || skipAutomaticCopy) {
+        await this.dataOverrideUpdaters.get(resolvedPath)?.(dataFilesOverride);
+      }
       existingPanel.title = title;
       existingPanel.reveal(vscode.ViewColumn.Active);
       return;
@@ -44,7 +57,7 @@ export class DashboardWebviewManager {
       return;
     }
 
-    const opening = this.createPanel(resolvedPath, title);
+    const opening = this.createPanel(resolvedPath, title, dataFilesOverride, skipAutomaticCopy);
     this.openingPanels.set(resolvedPath, opening);
     try {
       await opening;
@@ -55,7 +68,27 @@ export class DashboardWebviewManager {
     }
   }
 
-  private async createPanel(resolvedPath: string, title: string): Promise<void> {
+  async updateDataCopy(
+    dashboardPath: string,
+    dataFilesOverride: DataFilesOverride | undefined,
+    reveal = false
+  ): Promise<void> {
+    const resolvedPath = path.resolve(dashboardPath);
+    const updater = this.dataOverrideUpdaters.get(resolvedPath);
+    if (updater) {
+      await updater(dataFilesOverride);
+    }
+    if (reveal) {
+      this.panels.get(resolvedPath)?.reveal(vscode.ViewColumn.Active);
+    }
+  }
+
+  private async createPanel(
+    resolvedPath: string,
+    title: string,
+    initialDataFilesOverride?: DataFilesOverride,
+    skipAutomaticCopy = false
+  ): Promise<void> {
     const vuePath = path.join(resolvedPath, "vue");
     const dataPath = path.join(resolvedPath, "data");
     if (!fs.existsSync(path.join(vuePath, "index.html"))) {
@@ -65,12 +98,14 @@ export class DashboardWebviewManager {
     const previewRows = readPreviewRows();
     const maxRows = readMaxRows();
     const pauseWhenHidden = readPauseWhenHidden();
-    let activeCopy = await this.prepareLocalCopy(resolvedPath);
-    let activeDataPath = activeCopy?.dataPath;
+    let activeCopy = skipAutomaticCopy || initialDataFilesOverride
+      ? undefined
+      : await this.prepareLocalCopy(resolvedPath);
+    let activeDataFilesOverride = initialDataFilesOverride;
+    let activeDataPath = initialDataFilesOverride?.rootPath ?? activeCopy?.dataPath;
     let databaseLease = databaseOptions.reuseInstance
-      ? this.duckDb.retainDashboard(resolvedPath, activeDataPath)
+      ? this.duckDb.retainDashboard(resolvedPath, activeDataPath, activeDataFilesOverride)
       : undefined;
-    const dataWatchPatterns = this.duckDb.getDataWatchPatterns(resolvedPath, activeDataPath);
     let panel: vscode.WebviewPanel;
     try {
       panel = vscode.window.createWebviewPanel(
@@ -98,11 +133,8 @@ export class DashboardWebviewManager {
     const vueWatcher = vscode.workspace.createFileSystemWatcher(
       new vscode.RelativePattern(vscode.Uri.file(vuePath), "**/*")
     );
-    const dataWatchers = dataWatchPatterns.map(({ basePath, pattern }) =>
-      vscode.workspace.createFileSystemWatcher(
-        new vscode.RelativePattern(vscode.Uri.file(basePath), pattern)
-      )
-    );
+    let dataWatchers: vscode.FileSystemWatcher[] = [];
+    let dataWatcherSubscriptions: vscode.Disposable[] = [];
 
     const updateHtml = (): void => {
       try {
@@ -124,7 +156,8 @@ export class DashboardWebviewManager {
           force,
           activeDataPath,
           databaseOptions,
-          previewRows
+          previewRows,
+          activeDataFilesOverride
         );
         await postHostMessage(panel.webview, { command: "initData", data });
       } catch (error) {
@@ -135,7 +168,7 @@ export class DashboardWebviewManager {
     const invalidateData = async (): Promise<void> => {
       try {
         cancelActiveQueries();
-        await this.duckDb.invalidate(resolvedPath, activeDataPath);
+        await this.duckDb.invalidate(resolvedPath, activeDataPath, activeDataFilesOverride);
         if (ready) {
           await sendInitialData(true);
         }
@@ -162,10 +195,12 @@ export class DashboardWebviewManager {
       const previousCopy = activeCopy;
       activeCopy = nextCopy;
       activeDataPath = nextCopy.dataPath;
+      activeDataFilesOverride = undefined;
       databaseLease = databaseOptions.reuseInstance
         ? this.duckDb.retainDashboard(resolvedPath, activeDataPath)
         : undefined;
       await previousCopy?.dispose();
+      refreshDataWatchers();
       if (ready) {
         await sendInitialData(true);
       }
@@ -233,6 +268,47 @@ export class DashboardWebviewManager {
       }, 1000);
     };
 
+    const refreshDataWatchers = (): void => {
+      for (const subscription of dataWatcherSubscriptions) {
+        subscription.dispose();
+      }
+      for (const watcher of dataWatchers) {
+        watcher.dispose();
+      }
+      dataWatcherSubscriptions = [];
+      dataWatchers = this.duckDb.getDataWatchPatterns(
+        resolvedPath,
+        activeDataPath,
+        activeDataFilesOverride
+      ).map(({ basePath, pattern }) => vscode.workspace.createFileSystemWatcher(
+        new vscode.RelativePattern(vscode.Uri.file(basePath), pattern)
+      ));
+      dataWatcherSubscriptions = dataWatchers.flatMap((watcher) => [
+        watcher.onDidChange(scheduleDataRefresh),
+        watcher.onDidCreate(scheduleDataRefresh),
+        watcher.onDidDelete(scheduleDataRefresh)
+      ]);
+    };
+
+    refreshDataWatchers();
+    const updateDataCopy = async (nextOverride: DataFilesOverride | undefined): Promise<void> => {
+      cancelActiveQueries();
+      await this.duckDb.invalidate(resolvedPath, activeDataPath, activeDataFilesOverride);
+      await databaseLease?.dispose();
+      await activeCopy?.dispose();
+      activeCopy = undefined;
+      activeDataFilesOverride = nextOverride;
+      activeDataPath = nextOverride?.rootPath;
+      databaseLease = databaseOptions.reuseInstance
+        ? this.duckDb.retainDashboard(resolvedPath, activeDataPath, activeDataFilesOverride)
+        : undefined;
+      refreshDataWatchers();
+      if (ready) {
+        await sendInitialData(true);
+      }
+    };
+    this.dataOverrideUpdaters.set(resolvedPath, updateDataCopy);
+
     const visibilityWatcher = panel.onDidChangeViewState(({ webviewPanel }) => {
       if (!pauseWhenHidden) {
         return;
@@ -254,7 +330,6 @@ export class DashboardWebviewManager {
     const subscriptions: vscode.Disposable[] = [
       vueWatcher,
       visibilityWatcher,
-      ...dataWatchers,
       ...(sourceWatcher ? [sourceWatcher] : []),
       vueWatcher.onDidChange(updateHtml),
       vueWatcher.onDidCreate(updateHtml),
@@ -264,11 +339,6 @@ export class DashboardWebviewManager {
         sourceWatcher.onDidCreate((uri) => scheduleCopyUpdatePrompt(uri)),
         sourceWatcher.onDidDelete((uri) => scheduleCopyUpdatePrompt(uri))
       ] : []),
-      ...dataWatchers.flatMap((watcher) => [
-        watcher.onDidChange(scheduleDataRefresh),
-        watcher.onDidCreate(scheduleDataRefresh),
-        watcher.onDidDelete(scheduleDataRefresh)
-      ]),
       panel.webview.onDidReceiveMessage(async (message: unknown) => {
         const request = parseWebviewMessage(message);
         if (!request) {
@@ -282,7 +352,7 @@ export class DashboardWebviewManager {
         }
         if (request.command === "refresh") {
           cancelActiveQueries();
-          await this.duckDb.invalidate(resolvedPath, activeDataPath);
+          await this.duckDb.invalidate(resolvedPath, activeDataPath, activeDataFilesOverride);
           await sendInitialData(true);
           return;
         }
@@ -316,7 +386,8 @@ export class DashboardWebviewManager {
               request.force === true,
               activeDataPath,
               databaseOptions,
-              { maxRows, signal: controller.signal }
+              { maxRows, signal: controller.signal },
+              activeDataFilesOverride
             );
             if (disposed || controller.signal.aborted) {
               return;
@@ -350,6 +421,9 @@ export class DashboardWebviewManager {
         if (this.panels.get(resolvedPath) === panel) {
           this.panels.delete(resolvedPath);
         }
+        if (this.dataOverrideUpdaters.get(resolvedPath) === updateDataCopy) {
+          this.dataOverrideUpdaters.delete(resolvedPath);
+        }
         if (sourceChangeTimer) {
           clearTimeout(sourceChangeTimer);
         }
@@ -367,6 +441,12 @@ export class DashboardWebviewManager {
         });
         for (const subscription of subscriptions) {
           subscription.dispose();
+        }
+        for (const subscription of dataWatcherSubscriptions) {
+          subscription.dispose();
+        }
+        for (const watcher of dataWatchers) {
+          watcher.dispose();
         }
       })
     ];

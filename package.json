@@ -2,7 +2,7 @@
   "name": "f4datadashb",
   "displayName": "%extension.displayName%",
   "description": "%extension.description%",
-  "version": "0.0.2",
+  "version": "0.0.3",
   "publisher": "yves0003",
   "license": "MIT",
   "icon": "media/icon.png",
@@ -25,6 +25,12 @@
     "onCommand:f4datadashb.generateDashboardInFolder",
     "onCommand:f4datadashb.removeDashboard",
     "onCommand:f4datadashb.openDashboard",
+    "onCommand:f4datadashb.openDashboardDocument",
+    "onCommand:f4datadashb.refreshDashboards",
+    "onCommand:f4datadashb.diagnoseDashboard",
+    "onCommand:f4datadashb.copyDashboardData",
+    "onCommand:f4datadashb.updateDashboardDataCopy",
+    "onCommand:f4datadashb.removeDashboardDataCopy",
     "onCommand:f4datadashb.clearLocalCopies",
     "onCommand:f4datadashb.releaseDashboardDatabase",
     "onCommand:f4datadashb.openSettings",
@@ -33,6 +39,7 @@
   ],
   "main": "./out/extension.js",
   "contributes": {
+    "markdown.markdownItPlugins": true,
     "viewsContainers": {
       "activitybar": [
         {
@@ -87,6 +94,28 @@
         "command": "f4datadashb.openDashboard",
         "title": "%command.openDashboard%",
         "icon": "$(eye)"
+      },
+      {
+        "command": "f4datadashb.refreshDashboards",
+        "title": "%command.refreshDashboards%",
+        "icon": "$(refresh)"
+      },
+      {
+        "command": "f4datadashb.diagnoseDashboard",
+        "title": "%command.diagnoseDashboard%",
+        "icon": "$(checklist)"
+      },
+      {
+        "command": "f4datadashb.copyDashboardData",
+        "title": "%command.copyDashboardData%"
+      },
+      {
+        "command": "f4datadashb.updateDashboardDataCopy",
+        "title": "%command.updateDashboardDataCopy%"
+      },
+      {
+        "command": "f4datadashb.removeDashboardDataCopy",
+        "title": "%command.removeDashboardDataCopy%"
       },
       {
         "command": "f4datadashb.openSettings",
@@ -195,6 +224,11 @@
           "group": "navigation"
         },
         {
+          "command": "f4datadashb.diagnoseDashboard",
+          "when": "view == f4datadashb.dashboards",
+          "group": "navigation"
+        },
+        {
           "command": "f4datadashb.createDashboard",
           "when": "view == f4datadashb.dashboards",
           "group": "navigation"
@@ -203,52 +237,77 @@
           "command": "f4datadashb.openSettings",
           "when": "view == f4datadashb.dashboards",
           "group": "navigation"
+        },
+        {
+          "command": "f4datadashb.refreshDashboards",
+          "when": "view == f4datadashb.dashboards",
+          "group": "navigation"
         }
       ],
       "view/item/context": [
         {
           "command": "f4datadashb.openDashboard",
-          "when": "view == f4datadashb.dashboards && (viewItem == f4datadashb.dashboardItem || viewItem == f4datadashb.dashboardFavoriteItem)",
+          "when": "view == f4datadashb.dashboards && viewItem =~ /^f4datadashb\\.(dashboardItem|dashboardFavoriteItem)(\\.(copyAvailable|hasCopy))?(\\.databaseSession)?$/",
           "group": "inline"
         },
         {
           "command": "f4datadashb.addFavorite",
-          "when": "view == f4datadashb.dashboards && viewItem == f4datadashb.dashboardItem",
+          "when": "view == f4datadashb.dashboards && viewItem =~ /^f4datadashb\\.dashboardItem(\\.(copyAvailable|hasCopy))?(\\.databaseSession)?$/",
           "group": "inline"
         },
         {
           "command": "f4datadashb.removeFavorite",
-          "when": "view == f4datadashb.dashboards && viewItem == f4datadashb.dashboardFavoriteItem",
+          "when": "view == f4datadashb.dashboards && viewItem =~ /^f4datadashb\\.dashboardFavoriteItem(\\.(copyAvailable|hasCopy))?(\\.databaseSession)?$/",
           "group": "inline"
         },
         {
           "command": "f4datadashb.openDashboard",
-          "when": "view == f4datadashb.favorites && viewItem == f4datadashb.favoriteDashboardItem",
+          "when": "view == f4datadashb.favorites && viewItem =~ /^f4datadashb\\.favoriteDashboardItem(\\.(copyAvailable|hasCopy))?(\\.databaseSession)?$/",
           "group": "inline"
         },
         {
           "command": "f4datadashb.removeDashboard",
-          "when": "view == f4datadashb.dashboards && (viewItem == f4datadashb.dashboardItem || viewItem == f4datadashb.dashboardFavoriteItem)",
+          "when": "view == f4datadashb.dashboards && viewItem =~ /^f4datadashb\\.(dashboardItem|dashboardFavoriteItem)(\\.(copyAvailable|hasCopy))?(\\.databaseSession)?$/",
           "group": "navigation"
         },
         {
           "command": "f4datadashb.releaseDashboardDatabase",
-          "when": "view == f4datadashb.dashboards && (viewItem == f4datadashb.dashboardItem || viewItem == f4datadashb.dashboardFavoriteItem)",
+          "when": "view == f4datadashb.dashboards && viewItem =~ /^f4datadashb\\.(dashboardItem|dashboardFavoriteItem)(\\.(copyAvailable|hasCopy))?\\.databaseSession$/",
+          "group": "navigation"
+        },
+        {
+          "command": "f4datadashb.diagnoseDashboard",
+          "when": "view == f4datadashb.dashboards && viewItem =~ /^f4datadashb\\.(dashboardItem|dashboardFavoriteItem)(\\.(copyAvailable|hasCopy))?(\\.databaseSession)?$/",
+          "group": "navigation"
+        },
+        {
+          "command": "f4datadashb.copyDashboardData",
+          "when": "view == f4datadashb.dashboards && viewItem =~ /^f4datadashb\\.(dashboardItem|dashboardFavoriteItem)\\.copyAvailable(\\.databaseSession)?$/",
+          "group": "navigation"
+        },
+        {
+          "command": "f4datadashb.updateDashboardDataCopy",
+          "when": "view == f4datadashb.dashboards && viewItem =~ /^f4datadashb\\.(dashboardItem|dashboardFavoriteItem)\\.hasCopy(\\.databaseSession)?$/",
+          "group": "navigation"
+        },
+        {
+          "command": "f4datadashb.removeDashboardDataCopy",
+          "when": "view == f4datadashb.dashboards && viewItem =~ /^f4datadashb\\.(dashboardItem|dashboardFavoriteItem)\\.hasCopy(\\.databaseSession)?$/",
           "group": "navigation"
         },
         {
           "command": "f4datadashb.removeDashboard",
-          "when": "view == f4datadashb.favorites && viewItem == f4datadashb.favoriteDashboardItem",
+          "when": "view == f4datadashb.favorites && viewItem =~ /^f4datadashb\\.favoriteDashboardItem(\\.(copyAvailable|hasCopy))?(\\.databaseSession)?$/",
           "group": "navigation"
         },
         {
           "command": "f4datadashb.releaseDashboardDatabase",
-          "when": "view == f4datadashb.favorites && viewItem == f4datadashb.favoriteDashboardItem",
+          "when": "view == f4datadashb.favorites && viewItem =~ /^f4datadashb\\.favoriteDashboardItem(\\.(copyAvailable|hasCopy))?\\.databaseSession$/",
           "group": "navigation"
         },
         {
           "command": "f4datadashb.removeFavorite",
-          "when": "view == f4datadashb.favorites && viewItem == f4datadashb.favoriteDashboardItem",
+          "when": "view == f4datadashb.favorites && viewItem =~ /^f4datadashb\\.favoriteDashboardItem(\\.(copyAvailable|hasCopy))?(\\.databaseSession)?$/",
           "group": "inline"
         }
       ]
@@ -260,12 +319,15 @@
     "watch": "tsc -watch -p ./",
     "check": "tsc --noEmit -p ./",
     "test": "npm run compile && node --test",
-    "package:extension": "node -e \"require('node:fs').mkdirSync('package', { recursive: true })\" && vsce package --out package/f4datadashb-0.0.2.vsix"
+    "package:extension": "node -e \"require('node:fs').mkdirSync('package', { recursive: true })\" && vsce package --out package/f4datadashb-0.0.3.vsix"
   },
   "dependencies": {
-    "@duckdb/node-api": "^2.0.0-r.1"
+    "@duckdb/node-api": "^2.0.0-r.1",
+    "markdown-it-collapsible": "^2.0.2",
+    "markdown-it-task-lists": "^2.1.1"
   },
   "devDependencies": {
+    "@types/markdown-it": "^14.2.0",
     "@types/node": "^20.12.12",
     "@types/vscode": "^1.90.0",
     "@vscode/vsce": "^4.0.0",

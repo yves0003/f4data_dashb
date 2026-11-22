@@ -9,6 +9,11 @@ export interface DataFile {
   alias?: string;
 }
 
+export interface DataFilesOverride {
+  rootPath: string;
+  files: DataFile[];
+}
+
 export interface DataWatchPattern {
   basePath: string;
   pattern: string;
@@ -54,6 +59,25 @@ export interface DatasetResult {
 export interface InitialData {
   files: string[];
   datasets: DatasetResult[];
+}
+
+export interface ExpectedDatasetSchema {
+  dataset: string;
+  columns: string[];
+}
+
+export interface DatasetSchemaCheck {
+  dataset: string;
+  status: "valid" | "missing-dataset" | "missing-columns" | "unavailable" | "skipped";
+  missingColumns: string[];
+  error?: string;
+}
+
+export interface DashboardSchemaDiagnostic {
+  configured: boolean;
+  files: string[];
+  datasets: DatasetResult[];
+  checks: DatasetSchemaCheck[];
 }
 
 type QueryCacheEntry = {
@@ -104,17 +128,31 @@ export class DuckDbService {
   private readonly sessions = new Map<string, DatabaseSession>();
   private readonly pendingSessions = new Map<string, Promise<DatabaseSession>>();
   private readonly dashboardReferences = new Map<string, number>();
+  private readonly sessionChangeListeners = new Set<(dashboardPath: string) => void>();
+
+  onDidChangeSessions(listener: (dashboardPath: string) => void): { dispose(): void } {
+    this.sessionChangeListeners.add(listener);
+    return {
+      dispose: () => this.sessionChangeListeners.delete(listener)
+    };
+  }
+
+  hasDashboardSession(dashboardPath: string): boolean {
+    const prefix = `${path.resolve(dashboardPath)}\0`;
+    return [...this.sessions.keys()].some((key) => key.startsWith(prefix));
+  }
 
   async loadInitialData(
     dashboardPath: string,
     force = false,
     dataRootOverride?: string,
     sessionOptions?: DuckDbRuntimeOptions,
-    previewRows = 100
+    previewRows = 100,
+    dataFilesOverride?: DataFilesOverride
   ): Promise<InitialData> {
-    const files = resolveDataFiles(dashboardPath, dataRootOverride);
+    const files = resolveDataFiles(dashboardPath, dataRootOverride, dataFilesOverride);
     const fingerprint = getFingerprint(files);
-    const cacheKey = `${dashboardCacheKey(dashboardPath, dataRootOverride)}\0initial:${previewRows}`;
+    const cacheKey = `${dashboardCacheKey(dashboardPath, dataRootOverride, dataFilesOverride)}\0initial:${previewRows}`;
     const cached = !force ? this.getCached<InitialData>(cacheKey, fingerprint) : undefined;
     if (cached) {
       return JSON.parse(JSON.stringify(cached)) as InitialData;
@@ -173,7 +211,7 @@ export class DuckDbService {
           }
         }
         return results;
-      }, dashboardPath, dataRootOverride, sessionOptions);
+      }, dashboardPath, dataRootOverride, sessionOptions, dataFilesOverride);
 
       const data: InitialData = {
         files: files.map((file) => file.alias ? `${file.alias} (${file.name})` : file.name),
@@ -186,13 +224,61 @@ export class DuckDbService {
     });
   }
 
+  async diagnoseSchema(dashboardPath: string, dataRootOverride?: string): Promise<DashboardSchemaDiagnostic> {
+    const expected = readExpectedSchema(dashboardPath);
+    const data = await this.loadInitialData(dashboardPath, true, dataRootOverride, undefined, 0);
+    const checks: DatasetSchemaCheck[] = [];
+
+    for (const expectation of expected ?? []) {
+      const dataset = data.datasets.find((candidate) => candidate.name === expectation.dataset);
+      if (dataset?.error) {
+        checks.push({
+          dataset: expectation.dataset,
+          status: "unavailable",
+          missingColumns: [],
+          error: dataset.error
+        });
+        continue;
+      }
+      if (!dataset) {
+        const sourceError = data.datasets.find((candidate) => candidate.error)?.error;
+        const unavailable = sourceError ?? (
+          data.files.length === 0 ? "no-data-files" : undefined
+        );
+        checks.push({
+          dataset: expectation.dataset,
+          status: unavailable ? "skipped" : "missing-dataset",
+          missingColumns: [],
+          ...(unavailable ? { error: unavailable } : {})
+        });
+        continue;
+      }
+
+      const availableColumns = new Set(dataset.columns.map((column) => column.toLowerCase()));
+      const missingColumns = expectation.columns.filter((column) => !availableColumns.has(column.toLowerCase()));
+      checks.push({
+        dataset: expectation.dataset,
+        status: missingColumns.length > 0 ? "missing-columns" : "valid",
+        missingColumns
+      });
+    }
+
+    return {
+      configured: expected !== undefined,
+      files: data.files,
+      datasets: data.datasets,
+      checks
+    };
+  }
+
   async query(
     dashboardPath: string,
     sql: string,
     force = false,
     dataRootOverride?: string,
     sessionOptions?: DuckDbRuntimeOptions,
-    queryOptions: QueryOptions = {}
+    queryOptions: QueryOptions = {},
+    dataFilesOverride?: DataFilesOverride
   ): Promise<QueryCacheEntry> {
     if (
       queryOptions.maxRows !== undefined &&
@@ -201,9 +287,9 @@ export class DuckDbService {
       throw new Error("DuckDB query maxRows must be 0 (unlimited) or an integer between 1 and 100000");
     }
     const maxRows = queryOptions.maxRows === 0 ? undefined : queryOptions.maxRows;
-    const files = resolveDataFiles(dashboardPath, dataRootOverride);
+    const files = resolveDataFiles(dashboardPath, dataRootOverride, dataFilesOverride);
     const fingerprint = getFingerprint(files);
-    const key = `${dashboardCacheKey(dashboardPath, dataRootOverride)}\0query:${maxRows ?? "all"}:${sql.trim()}`;
+    const key = `${dashboardCacheKey(dashboardPath, dataRootOverride, dataFilesOverride)}\0query:${maxRows ?? "all"}:${sql.trim()}`;
     const cached = !force ? this.getCached<QueryCacheEntry>(key, fingerprint) : undefined;
     if (cached) {
       return cached;
@@ -213,7 +299,7 @@ export class DuckDbService {
     const executeQuery = async (): Promise<QueryCacheEntry> => {
       const result = await this.withDatabase(files, async (connection) => {
         return readQuery(connection, sql, maxRows, queryOptions.signal);
-      }, dashboardPath, dataRootOverride, sessionOptions);
+      }, dashboardPath, dataRootOverride, sessionOptions, dataFilesOverride);
       const entry = {
         fingerprint,
         ...result,
@@ -230,13 +316,17 @@ export class DuckDbService {
       : this.deduplicate(key, fingerprint, executeQuery);
   }
 
-  async invalidate(dashboardPath: string, dataRootOverride?: string): Promise<void> {
+  async invalidate(
+    dashboardPath: string,
+    dataRootOverride?: string,
+    dataFilesOverride?: DataFilesOverride
+  ): Promise<void> {
     this.cacheGenerations.set(
       path.resolve(dashboardPath),
       this.cacheGeneration(dashboardPath) + 1
     );
-    if (dataRootOverride) {
-      const key = dashboardCacheKey(dashboardPath, dataRootOverride);
+    if (dataRootOverride || dataFilesOverride) {
+      const key = dashboardCacheKey(dashboardPath, dataRootOverride, dataFilesOverride);
       this.clearCached(`${key}\0`);
       this.clearPending(`${key}\0`);
       const session = this.sessions.get(key);
@@ -252,8 +342,12 @@ export class DuckDbService {
     await Promise.all(sessions.map((session) => this.closeSession(session)));
   }
 
-  retainDashboard(dashboardPath: string, dataRootOverride?: string): { dispose(): Promise<void> } {
-    const key = dashboardCacheKey(dashboardPath, dataRootOverride);
+  retainDashboard(
+    dashboardPath: string,
+    dataRootOverride?: string,
+    dataFilesOverride?: DataFilesOverride
+  ): { dispose(): Promise<void> } {
+    const key = dashboardCacheKey(dashboardPath, dataRootOverride, dataFilesOverride);
     this.dashboardReferences.set(key, (this.dashboardReferences.get(key) ?? 0) + 1);
     let disposed = false;
     return {
@@ -291,10 +385,14 @@ export class DuckDbService {
     this.cacheGenerations.clear();
   }
 
-  getDataWatchPatterns(dashboardPath: string, dataRootOverride?: string): DataWatchPattern[] {
-    const files = resolveDataFiles(dashboardPath, dataRootOverride);
+  getDataWatchPatterns(
+    dashboardPath: string,
+    dataRootOverride?: string,
+    dataFilesOverride?: DataFilesOverride
+  ): DataWatchPattern[] {
+    const files = resolveDataFiles(dashboardPath, dataRootOverride, dataFilesOverride);
     const directories = new Set(files.map((file) => path.dirname(file.path)));
-    if (files.length === 0 && !hasConfiguredDataSources(dashboardPath)) {
+    if (files.length === 0 && !dataFilesOverride && !hasConfiguredDataSources(dashboardPath)) {
       directories.add(path.resolve(dataRootOverride ?? path.join(dashboardPath, "data")));
     }
     return [...directories].map((basePath) => ({ basePath, pattern: "**/*" }));
@@ -388,13 +486,14 @@ export class DuckDbService {
     callback: (connection: DuckDbConnection, fileErrors: Map<string, string>) => Promise<T>,
     dashboardPath: string,
     dataRootOverride?: string,
-    sessionOptions?: DuckDbRuntimeOptions
+    sessionOptions?: DuckDbRuntimeOptions,
+    dataFilesOverride?: DataFilesOverride
   ): Promise<T> {
     if (sessionOptions?.reuseInstance) {
       return this.withPersistentDatabase(
         files,
         callback,
-        dashboardCacheKey(dashboardPath, dataRootOverride),
+        dashboardCacheKey(dashboardPath, dataRootOverride, dataFilesOverride),
         sessionOptions
       );
     }
@@ -492,6 +591,7 @@ export class DuckDbService {
         closed: false
       };
       this.sessions.set(key, session);
+      this.fireSessionChanged(key);
       return session;
     } catch (error) {
       try {
@@ -578,6 +678,7 @@ export class DuckDbService {
     }
     if (this.sessions.get(session.key) === session) {
       this.sessions.delete(session.key);
+      this.fireSessionChanged(session.key);
     }
     session.waiting.splice(0).forEach((waiter) => {
       waiter.reject(new Error("DuckDB dashboard session is closing"));
@@ -617,6 +718,13 @@ export class DuckDbService {
       session.resolveClose?.();
     }
   }
+
+  private fireSessionChanged(key: string): void {
+    const dashboardPath = key.slice(0, key.indexOf("\0"));
+    for (const listener of this.sessionChangeListeners) {
+      listener(dashboardPath);
+    }
+  }
 }
 
 function listDataFiles(dataPath: string): DataFile[] {
@@ -642,11 +750,30 @@ function listDataFiles(dataPath: string): DataFile[] {
     .sort((left, right) => left.name.localeCompare(right.name));
 }
 
-function dashboardCacheKey(dashboardPath: string, dataRootOverride?: string): string {
-  return `${path.resolve(dashboardPath)}\0${dataRootOverride ? path.resolve(dataRootOverride) : ""}`;
+function dashboardCacheKey(
+  dashboardPath: string,
+  dataRootOverride?: string,
+  dataFilesOverride?: DataFilesOverride
+): string {
+  const overrideRoot = dataFilesOverride?.rootPath ?? dataRootOverride;
+  return `${path.resolve(dashboardPath)}\0${overrideRoot ? path.resolve(overrideRoot) : ""}`;
 }
 
-function resolveDataFiles(dashboardPath: string, dataRootOverride?: string): DataFile[] {
+export function resolveDashboardDataFiles(dashboardPath: string): DataFile[] {
+  return resolveDataFiles(dashboardPath);
+}
+
+function resolveDataFiles(
+  dashboardPath: string,
+  dataRootOverride?: string,
+  dataFilesOverride?: DataFilesOverride
+): DataFile[] {
+  if (dataFilesOverride) {
+    return dataFilesOverride.files.map((file) => ({
+      ...file,
+      path: path.resolve(file.path)
+    }));
+  }
   const resolvedDashboardPath = path.resolve(dashboardPath);
   const manifestPath = path.join(resolvedDashboardPath, "package.json");
   const parsedManifest: unknown = JSON.parse(fs.readFileSync(manifestPath, "utf8"));
@@ -741,6 +868,45 @@ function parseDataSource(value: unknown): DataSourceConfig {
     path: source.path.trim(),
     type: source.type
   };
+}
+
+function readExpectedSchema(dashboardPath: string): ExpectedDatasetSchema[] | undefined {
+  const manifestPath = path.join(path.resolve(dashboardPath), "package.json");
+  const parsedManifest: unknown = JSON.parse(fs.readFileSync(manifestPath, "utf8"));
+  if (typeof parsedManifest !== "object" || parsedManifest === null || Array.isArray(parsedManifest)) {
+    throw new Error("Dashboard package.json must contain a JSON object");
+  }
+  const manifest = parsedManifest as Record<string, unknown>;
+  if (!Object.prototype.hasOwnProperty.call(manifest, "expectedSchema")) {
+    return undefined;
+  }
+  if (!Array.isArray(manifest.expectedSchema)) {
+    throw new Error("Dashboard package.json expectedSchema must be an array");
+  }
+
+  const datasets = new Set<string>();
+  return manifest.expectedSchema.map((value, index) => {
+    if (typeof value !== "object" || value === null || Array.isArray(value)) {
+      throw new Error(`expectedSchema[${index}] must be an object`);
+    }
+    const item = value as Record<string, unknown>;
+    if (typeof item.dataset !== "string" || !item.dataset.trim()) {
+      throw new Error(`expectedSchema[${index}].dataset must be a non-empty string`);
+    }
+    const dataset = item.dataset.trim();
+    if (datasets.has(dataset)) {
+      throw new Error(`expectedSchema contains duplicate dataset "${dataset}"`);
+    }
+    datasets.add(dataset);
+    if (!Array.isArray(item.columns) ||
+      item.columns.some((column) => typeof column !== "string" || !column.trim())) {
+      throw new Error(`expectedSchema[${index}].columns must be an array of non-empty strings`);
+    }
+    return {
+      dataset,
+      columns: [...new Set((item.columns as string[]).map((column) => column.trim()))]
+    };
+  });
 }
 
 function normalizeSourcePath(dashboardPath: string, sourcePath: string): string {

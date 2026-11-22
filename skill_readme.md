@@ -39,6 +39,7 @@ Pour éviter de parcourir inutilement toute l'arborescence lors d'un import :
   - Le fichier `package.json` et le `vite.config.js` (pointant vers `../vue`).
   - Un template de base React (`App.jsx`).
   - **Génération automatique du Skill / Guide :** Créer également un fichier `SKILL_GUIDE.md` à la racine du nouveau dashboard généré, contenant les instructions obligatoires pour le développeur (gestion de `acquireVsCodeApi()`, double mode navigateur/VS Code via `npm run dev`, communication bidirectionnelle, et les 4 états UI obligatoires : chargement, erreur, vide, nominal).
+  - **Schéma attendu facultatif :** Expliquer comment déclarer `expectedSchema` dans `package.json` pour que la commande de diagnostic vérifie les datasets et colonnes indispensables au dashboard. Fournir un exemple JSON combinant une source tabulaire et une table DuckDB. Préciser que `dataset` reprend le nom affiché par le diagnostic (`<alias de source>: <nom de table>` pour DuckDB), qu'il faut limiter la déclaration aux colonnes réellement utilisées, et que l'absence de `expectedSchema` désactive la comparaison. Les sources impossibles à inspecter doivent être signalées comme ignorées, jamais comme des schémas manquants.
 
 ### 6. Gestion de la Webview, de DuckDB, du Cache et du Double Watcher
 - **Ouverture de la Webview & Requêtage DuckDB :**

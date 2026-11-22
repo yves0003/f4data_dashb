@@ -6,12 +6,14 @@ const test = require("node:test");
 const { DuckDBInstance } = require("@duckdb/node-api");
 const {
   getLocalCacheRoot,
+  inspectUserDataCopy,
   isNetworkPath,
   isNetworkPathByMountTable,
   LocalCopyService,
-  parseMountTable
+  parseMountTable,
+  sanitizeDirectoryName
 } = require("../out/localCopyService");
-const { DuckDbService } = require("../out/duckdbService");
+const { DuckDbService, resolveDashboardDataFiles } = require("../out/duckdbService");
 
 function createToken(cancelled = false) {
   return {
@@ -171,6 +173,114 @@ test("cancellation returns to source without leaving a partial copy", async () =
     assert.equal(lease, undefined);
     assert.equal(copies.purge("session"), 0);
   } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("creates directly selected user copies and detects source and local-copy edits", async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "f4data-user-copy-"));
+  try {
+    const sourceRoot = path.join(root, "shared");
+    const selectedRoot = path.join(root, "local");
+    const targetRoot = path.join(selectedRoot, "Sales-Dashboard-a1b2c3d4");
+    const dashboardPath = path.join(root, "dashboard");
+    fs.mkdirSync(path.join(sourceRoot, "nested"), { recursive: true });
+    fs.mkdirSync(selectedRoot);
+    fs.mkdirSync(dashboardPath);
+    const sourcePath = path.join(sourceRoot, "sales.csv");
+    fs.writeFileSync(sourcePath, "id,amount\n1,42\n");
+    fs.writeFileSync(path.join(sourceRoot, "nested", "ignored.csv"), "id\n2\n");
+    fs.writeFileSync(path.join(dashboardPath, "package.json"), JSON.stringify({
+      dataSources: [{ name: "sales", type: "csv", path: "../shared" }]
+    }));
+    const files = resolveDashboardDataFiles(dashboardPath);
+    assert.deepEqual(files.map((file) => file.name), ["sales.csv"]);
+    const copies = new LocalCopyService();
+    const copy = await copies.createUserCopy(
+      files,
+      selectedRoot,
+      targetRoot,
+      { report() {} },
+      createToken()
+    );
+
+    assert.ok(copy);
+    assert.equal(copy.files.length, 1);
+    assert.ok(fs.existsSync(copy.files[0].copyPath));
+    assert.equal(fs.existsSync(path.join(targetRoot, "sources", "sales-1", "nested", "ignored.csv")), false);
+    assert.deepEqual(inspectUserDataCopy(copy, files), {
+      sourceChanged: false,
+      copyChanged: false,
+      missingCopy: false
+    });
+
+    fs.writeFileSync(sourcePath, "id,amount\n1,99\n");
+    fs.writeFileSync(copy.files[0].copyPath, "id,amount\n1,17\n");
+    assert.deepEqual(inspectUserDataCopy(copy, files), {
+      sourceChanged: true,
+      copyChanged: true,
+      missingCopy: false
+    });
+
+    fs.rmSync(copy.files[0].copyPath);
+    assert.equal(inspectUserDataCopy(copy, files).missingCopy, true);
+    assert.equal(sanitizeDirectoryName("Ventes / 2026?"), "Ventes-2026-");
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("queries a local DuckDB copy with its configured source alias", async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "f4data-user-copy-duckdb-"));
+  let instance;
+  try {
+    const dashboardPath = path.join(root, "dashboard");
+    const sourceRoot = path.join(root, "shared");
+    const selectedRoot = path.join(root, "local");
+    fs.mkdirSync(dashboardPath);
+    fs.mkdirSync(sourceRoot);
+    fs.mkdirSync(selectedRoot);
+    fs.mkdirSync(path.join(dashboardPath, "vue"));
+    const sourcePath = path.join(sourceRoot, "warehouse.duckdb");
+    instance = await DuckDBInstance.create(sourcePath);
+    const connection = await instance.connect();
+    const result = await connection.run(
+      "CREATE TABLE customers AS SELECT 42::INTEGER AS customer_id"
+    );
+    result.closeSync();
+    connection.closeSync();
+    instance.closeSync();
+    instance = undefined;
+    fs.writeFileSync(path.join(dashboardPath, "package.json"), JSON.stringify({
+      dataSources: [{ name: "warehouse", type: "duckdb", path: "../shared/warehouse.duckdb" }]
+    }));
+
+    const files = resolveDashboardDataFiles(dashboardPath);
+    const targetRoot = path.join(selectedRoot, "Sales-Dashboard-a1b2c3d4");
+    const copy = await new LocalCopyService().createUserCopy(
+      files,
+      selectedRoot,
+      targetRoot,
+      { report() {} },
+      createToken()
+    );
+    assert.ok(copy);
+    const override = {
+      rootPath: copy.targetRoot,
+      files: copy.files.map(({ source, copyPath }) => ({ ...source, path: copyPath }))
+    };
+    const query = await new DuckDbService().query(
+      dashboardPath,
+      'SELECT customer_id FROM "warehouse".main.customers',
+      true,
+      undefined,
+      undefined,
+      {},
+      override
+    );
+    assert.deepEqual(query.rows, [{ customer_id: 42 }]);
+  } finally {
+    instance?.closeSync();
     fs.rmSync(root, { recursive: true, force: true });
   }
 });
