@@ -7,4 +7,10 @@ skill_readme.md
 tsconfig.json
 **/*.map
 **/*.ts
-package/**
+packages/**
+test/**
+.gitignore
+node_modules/**/test/**
+node_modules/**/docs/**
+node_modules/**/.travis.yml
+node_modules/**/CHANGELOG.md
